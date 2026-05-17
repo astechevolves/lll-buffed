@@ -23,7 +23,7 @@ constexpr uint32_t MULTI_PRESS_MAX_MS = 500;
 constexpr uint32_t DEFAULT_TIMEOUT_MS = 90000;
 constexpr uint32_t DEFAULT_HOLD_TIMEOUT_MS = 10000;
 constexpr uint8_t DEFAULT_MULTI_PRESS_COUNT = 2;
-constexpr float DEFAULT_SPEED_MM_S = 30.0F;
+constexpr float DEFAULT_SPEED_MM_S = 45.0F;
 constexpr uint32_t DEFAULT_EMPTYING_PUSH_TIMEOUT_MS = 2500;
 
 constexpr size_t UART_CMD_BUF_SIZE = 64;
@@ -125,6 +125,17 @@ private:
   uint32_t lastMultiPressCount{ 0 };
   float lastSpeedMmS{ 0.0F };
   uint32_t lastEmptyingPushTimeoutMs{ 0 };
+
+#ifdef ENABLE_I2C_PROTOCOL
+  // Staged I2C byte writes let CP2112 write float registers using reliable
+  // 2-byte transactions: [register_offset, one_payload_byte].
+  // Avoids failing 5-byte write transaction while preserving
+  // the original full-register write path for hosts that support it.
+  uint8_t i2cMoveDistBytes[sizeof(float)]{};
+  uint8_t i2cSpeedBytes[sizeof(float)]{};
+  uint8_t i2cMoveDistMask{ 0 };
+  uint8_t i2cSpeedMask{ 0 };
+#endif
 
 public:
   Buffer() = default;
@@ -342,65 +353,137 @@ private:
     }
   }
 
-  void onI2CWrite(const uint8_t reg, const size_t size, const uint8_t *data) {
-    if (size == 0)
+  void applyI2CMoveDistance(const float dist) {
+    // Positive distance pushes/feeds. Negative distance retracts/pulls.
+    // The move duration is still calculated by firmware using speedMmS.
+    if (dist == 0.0F || speedMmS <= 0.0F) {
       return;
+    }
+
+    moveDir = dist > 0 ? Motor::Push : Motor::Retract;
+
+    const float ms = tiny::abs(dist) * 1000.0F / speedMmS;
+    moveEnd = hw.timeMs() + static_cast<uint32_t>(ms);
+
+    setMode(Mode::MoveCommand);
+    setMotor(moveDir);
+    updateStatus();
+  }
+
+  bool handleI2CStagedWrite(const uint8_t reg, const uint8_t value) {
+    // MOVE_DIST lives at 0x01..0x04 as a 4-byte little-endian float.
+    // Commit the move only after all four bytes have been received.
+    if (reg >= REG_MOVE_DIST && reg < REG_MOVE_DIST + sizeof(float)) {
+      const uint8_t offset = reg - REG_MOVE_DIST;
+
+      i2cMoveDistBytes[offset] = value;
+      i2cMoveDistMask |= static_cast<uint8_t>(1U << offset);
+
+      if (i2cMoveDistMask == 0x0F) {
+        float dist = 0.0F;
+        std::memcpy(&dist, i2cMoveDistBytes, sizeof(dist));
+
+        i2cMoveDistMask = 0;
+        applyI2CMoveDistance(dist);
+      }
+
+      return true;
+    }
+
+    // SPEED lives at 0x08..0x0B as a 4-byte little-endian float.
+    // Commit the new speed only after all four bytes have been received.
+    if (reg >= REG_PARAM_SPEED && reg < REG_PARAM_SPEED + sizeof(float)) {
+      const uint8_t offset = reg - REG_PARAM_SPEED;
+
+      i2cSpeedBytes[offset] = value;
+      i2cSpeedMask |= static_cast<uint8_t>(1U << offset);
+
+      if (i2cSpeedMask == 0x0F) {
+        float newSpeed = 0.0F;
+        std::memcpy(&newSpeed, i2cSpeedBytes, sizeof(newSpeed));
+
+        i2cSpeedMask = 0;
+
+        if (newSpeed > 0.0F) {
+          speedMmS = newSpeed;
+          updateStatus();
+        }
+      }
+
+      return true;
+    }
+
+    return false;
+  }
+
+  void onI2CWrite(const uint8_t reg, const size_t size, const uint8_t *data) {
+    if (size == 0) {
+      return;
+    }
+
+    // CP2112 currently fails on 5-byte writes, so allow staged 1-byte writes
+    // to float registers while preserving the original full-payload protocol.
+    if (size == 1 && handleI2CStagedWrite(reg, data[0])) {
+      return;
+    }
 
     switch (reg) {
     case REG_COMMAND:
       handleI2CCommand(data[0]);
       break;
+
     case REG_MOVE_DIST:
       if (size >= sizeof(float)) {
-        const auto dist = *reinterpret_cast<const float *>(data);
-        if (dist != 0.0F && speedMmS > 0.0F) {
-          moveDir = dist > 0 ? Motor::Push : Motor::Retract;
-          const float ms = tiny::abs(dist) * 1000.0F / speedMmS;
-          moveEnd = hw.timeMs() + static_cast<uint32_t>(ms);
-          setMode(Mode::MoveCommand);
-          setMotor(moveDir);
-          updateStatus();
-        }
+        float dist = 0.0F;
+        reinterpret_assign(dist, data);
+        applyI2CMoveDistance(dist);
       }
       break;
+
     case REG_PARAM_SPEED:
       if (size >= sizeof(speedMmS)) {
         reinterpret_assign(speedMmS, data);
         updateStatus();
       }
       break;
+
     case REG_PARAM_TIMEOUT:
       if (size >= sizeof(timeoutMs)) {
         reinterpret_assign(timeoutMs, data);
         updateStatus();
       }
       break;
+
     case REG_PARAM_EMPTYING_TIMEOUT:
       if (size >= sizeof(emptyingPushTimeoutMs)) {
         reinterpret_assign(emptyingPushTimeoutMs, data);
         updateStatus();
       }
       break;
+
     case REG_PARAM_HOLD_TIMEOUT:
       if (size >= sizeof(holdTimeoutMs)) {
         reinterpret_assign(holdTimeoutMs, data);
         updateStatus();
       }
       break;
+
     case REG_PARAM_HOLD_TIMEOUT_ENABLED:
       if (size >= 1) {
         holdTimeoutEnabled = data[0] != 0;
         updateStatus();
       }
       break;
+
     case REG_PARAM_MULTI_PRESS_COUNT:
       if (size >= sizeof(multiPressCount)) {
         reinterpret_assign(multiPressCount, data);
         updateStatus();
       }
       break;
+
     default:
-      // Unknown register, ignore
+      // Unknown register, ignore.
       break;
     }
   }

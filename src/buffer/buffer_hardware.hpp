@@ -62,13 +62,33 @@ class BufferHardware {
   }
 
   static void onI2CReceive(const int numBytes) {
-    if (numBytes == 1) {
-      pendingReadRegister = i2cRxBuffer[0];
-    } else if (numBytes > 1) {
-      constexpr int bufSize = sizeof(i2cRxBuffer);
-      for (int i = 0; i < numBytes && i < bufSize; ++i)
+    if (numBytes <= 0) {
+      return;
+    }
+
+    constexpr int bufSize = sizeof(i2cRxBuffer);
+    const int count = numBytes < bufSize ? numBytes : bufSize;
+
+    // Always consume the bytes from Wire.
+    // The original code did not call Wire.read() for numBytes == 1,
+    // so register-address-only reads reused stale i2cRxBuffer[0].
+    for (int i = 0; i < count; ++i) {
+      if (Wire.available()) {
         i2cRxBuffer[i] = static_cast<uint8_t>(Wire.read());
-      incomingI2CBytes = numBytes;
+      }
+    }
+
+    // Drain any extra bytes so the slave receive buffer is not left dirty.
+    while (Wire.available()) {
+      Wire.read();
+    }
+
+    if (count == 1) {
+      // Register address phase for a following read.
+      pendingReadRegister = i2cRxBuffer[0];
+    } else {
+      // Register + payload write, handled from the main loop.
+      incomingI2CBytes = count;
     }
   }
 
