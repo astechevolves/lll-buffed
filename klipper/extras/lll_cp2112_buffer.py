@@ -1,4 +1,3 @@
-#!/home/goofballtech/klippy-env/bin/python
 
 import argparse
 import hid
