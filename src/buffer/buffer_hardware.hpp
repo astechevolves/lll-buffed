@@ -33,6 +33,38 @@ constexpr float SPEED_RPM_FACTOR = 9.1463414634f;
 constexpr float STEPS_PER_REV = 200.0f;
 constexpr float SCREW_PITCH = 0.715f;
 
+// Raw optical sensor bitfield exposed for buffer status/debug only.
+// These are raw firmware pin reads, not trusted physical Hall position names.
+//
+// Live-tested raw bit patterns:
+//   0x01 = fully retracted/body side  -> low
+//   0x00 = middle / working normally  -> normal-low
+//   0x02 = center transition/range    -> normal-mid
+//   0x06 = extended/normal high range -> normal-high
+//   0x04 = over-full / retract zone   -> over-full
+inline constexpr uint8_t BUFFER_SENSOR_HALL1 = 1 << 0;
+inline constexpr uint8_t BUFFER_SENSOR_HALL2 = 1 << 1;
+inline constexpr uint8_t BUFFER_SENSOR_HALL3 = 1 << 2;
+
+// Human-readable interpreted buffer state.
+// STATE_LOW         = toolhead side is close to starving.
+// STATE_NORMAL_LOW  = usable lower-normal buffer range.
+// STATE_NORMAL_MID  = usable middle buffer range.
+// STATE_NORMAL_HIGH = usable upper-normal buffer range.
+// STATE_OVER_FULL   = feed side is close to skipping/ejecting PTFE.
+// STATE_UNKNOWN     = unmapped/invalid/transitional raw sensor pattern.
+//
+// Do not name enum members LOW/HIGH because Arduino defines LOW/HIGH
+// as macros in wiring_constants.h.
+enum class BufferFillState : uint8_t {
+  STATE_LOW = 0,
+  STATE_NORMAL_LOW = 1,
+  STATE_NORMAL_MID = 2,
+  STATE_NORMAL_HIGH = 3,
+  STATE_OVER_FULL = 4,
+  STATE_UNKNOWN = 5,
+};
+
 #ifdef ENABLE_I2C_PROTOCOL
 inline constexpr uint32_t I2C_INT_PIN = PA5;
 inline constexpr uint32_t I2C_SDA_PIN = PB11;
@@ -47,6 +79,10 @@ public:
 
 class BufferHardware {
   TMC2209Stepper driver{ STEPPER_UART, STEPPER_UART, STEPPER_R_SENSE, STEPPER_ADDR };
+
+  // Cached optical sensor state. Updated from the main loop so I2C reads can
+  // return the latest known value without doing extra work inside the request callback.
+  static inline volatile uint8_t cachedSensorBits = 0;
 
 #ifdef ENABLE_I2C_PROTOCOL
   static inline void *i2cContext = nullptr;
@@ -111,6 +147,8 @@ class BufferHardware {
 
 public:
   static void loop() {
+    updateSensorCache();
+
 #ifdef ENABLE_I2C_PROTOCOL
     handleI2CReceive();
 #endif
@@ -160,9 +198,94 @@ public:
     driver.VACTUAL(0);
     driver.en_spreadCycle(true);
     driver.pwm_autoscale(true);
+
+    updateSensorCache();
   }
 
   static constexpr int getBufferID() { return BUFFER_ID; }
+
+  static uint8_t readSensorBits() {
+    uint8_t bits = 0;
+
+    // opticalN() == true means that raw sensor input is currently triggered.
+    if (optical1())
+      bits |= BUFFER_SENSOR_HALL1;
+
+    if (optical2())
+      bits |= BUFFER_SENSOR_HALL2;
+
+    if (optical3())
+      bits |= BUFFER_SENSOR_HALL3;
+
+    return bits;
+  }
+
+  static void updateSensorCache() {
+    cachedSensorBits = readSensorBits();
+  }
+
+  static uint8_t getSensorBits() {
+    return cachedSensorBits;
+  }
+
+  static BufferFillState getFillStateFromBits(const uint8_t bits) {
+    // Live-tested raw optical bit map:
+    //
+    //   Bits   Optical3   Optical2   Optical1      Physical State              Interpreted State
+    //   ----   --------   --------   --------      ------------------------    -----------------
+    //   0x01   0          0          1             fully retracted/body side    low
+    //   0x00   0          0          0             middle / working normally    normal-low
+    //   0x02   0          1          0             center transition/range      normal-mid
+    //   0x06   1          1          0             extended/normal high range   normal-high
+    //   0x04   1          0          0             over-full / retract zone     over-full
+    //
+    // low means the toolhead can starve if it keeps pulling.
+    // normal-* means the buffer is in the usable operating range.
+    // over-full means the feed side is near/at the unsafe limit.
+    // unknown means the raw pattern is not mapped and should fail closed in host-side guards.
+
+    if (bits == 0x01)
+      return BufferFillState::STATE_LOW;
+
+    if (bits == 0x00)
+      return BufferFillState::STATE_NORMAL_LOW;
+
+    if (bits == 0x02)
+      return BufferFillState::STATE_NORMAL_MID;
+
+    if (bits == 0x06)
+      return BufferFillState::STATE_NORMAL_HIGH;
+
+    if (bits == 0x04)
+      return BufferFillState::STATE_OVER_FULL;
+
+    return BufferFillState::STATE_UNKNOWN;
+  }
+
+  static BufferFillState getFillState() {
+    return getFillStateFromBits(getSensorBits());
+  }
+
+  static const char *fillStateName(const BufferFillState state) {
+    switch (state) {
+      case BufferFillState::STATE_LOW:
+        return "low";
+      case BufferFillState::STATE_NORMAL_LOW:
+        return "normal-low";
+      case BufferFillState::STATE_NORMAL_MID:
+        return "normal-mid";
+      case BufferFillState::STATE_NORMAL_HIGH:
+        return "normal-high";
+      case BufferFillState::STATE_OVER_FULL:
+        return "over-full";
+      default:
+        return "unknown";
+    }
+  }
+
+  static const char *getFillStateName() {
+    return fillStateName(getFillState());
+  }
 
   static bool optical1() { return digitalRead(OPTICAL_SENSOR_1) != 0; }
   static bool optical2() { return digitalRead(OPTICAL_SENSOR_2) != 0; }

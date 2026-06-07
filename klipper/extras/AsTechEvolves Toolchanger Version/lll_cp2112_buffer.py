@@ -1,10 +1,14 @@
-
+#!/usr/bin/env python3
 import argparse
-import hid
 import os
 import struct
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import hid
 
 #####################################################################
 #                  LLL-Buffed CP2112 Buffer Helper
@@ -17,10 +21,14 @@ import time
 #   - bounded firmware moves: move by distance
 #   - settings: speed, timeout, emptying timeout, hold timeout,
 #     hold timeout enable, and multi-press count
-#   - status reads: filament prsent, timed out, mode, speed set, timeout values
+#   - status reads: filament present, timed out, mode, motor, speed,
+#     timeout values, raw optical sensor bits, and interpreted buffer state
+#   - capture-state writes the full decoded status set back into Klipper
+#     gcode_macro variables through Moonraker.
 #
 # Basic examples:
 #   BUFFER_CMD=status  ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#   BUFFER_CMD=sensors ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #   BUFFER_CMD=auto    ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #   BUFFER_CMD=off     ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #
@@ -38,6 +46,14 @@ import time
 #   BUFFER_CMD=hold-timeout BUFFER_HOLD_TIMEOUT_MS=10000 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #   BUFFER_CMD=hold-timeout-enable BUFFER_HOLD_TIMEOUT_ENABLE=1 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #
+# Safety/status examples:
+#   BUFFER_CMD=sensors ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#   BUFFER_CMD=assert-not-over-full ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#
+# Klipper variable capture examples:
+#   BUFFER_CMD=capture-state BUFFER_INDEX=0 STATE_MACRO=_LLL_BUFFER_STATE_0 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#   BUFFER_ADDR=0x11 BUFFER_CMD=capture-state BUFFER_INDEX=1 STATE_MACRO=_LLL_BUFFER_STATE_1 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#
 # Multi-buffer examples:
 #   BUFFER_ADDR=0x10 BUFFER_CMD=status ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #   BUFFER_ADDR=0x11 BUFFER_CMD=status ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
@@ -53,7 +69,7 @@ DEFAULT_ADDR_7BIT = 0x10
 #####################################################################
 #                  lll-buffed Virtual I2C Register Map
 #####################################################################
-# Register details match the lll-buffed README:
+# Register details match the lll-buffed README / local firmware extension:
 # - Little-endian values.
 # - Float registers are IEEE754 32-bit.
 # - Timeout/settings registers are uint32 or uint8.
@@ -73,6 +89,49 @@ REG_HOLD_TIMEOUT = 0x14
 REG_HOLD_TIMEOUT_EN = 0x18
 REG_MULTI_PRESS = 0x19
 
+# Local extension registers.
+# Firmware side exposes these from BufferHardware::getSensorBits()
+# and BufferHardware::getFillState().
+REG_SENSOR_BITS = 0x1A
+REG_FILL_STATE = 0x1B
+
+# Raw optical bitfield exposed by REG_SENSOR_BITS.
+# These are raw firmware pin reads, not physical Hall position names.
+#
+# Current firmware-side interpreted map:
+#   sensor_bits=0x01 -> low
+#   sensor_bits=0x00 -> normal-low
+#   sensor_bits=0x02 -> normal-mid
+#   sensor_bits=0x06 -> normal-high
+#   sensor_bits=0x04 -> over-full
+SENSOR_OPTICAL1 = 1 << 0
+SENSOR_OPTICAL2 = 1 << 1
+SENSOR_OPTICAL3 = 1 << 2
+
+# Interpreted state exposed by REG_FILL_STATE.
+# These values match the current firmware enum:
+#   STATE_LOW         = 0
+#   STATE_NORMAL_LOW  = 1
+#   STATE_NORMAL_MID  = 2
+#   STATE_NORMAL_HIGH = 3
+#   STATE_OVER_FULL   = 4
+#   STATE_UNKNOWN     = 5
+FILL_STATE_LOW = 0
+FILL_STATE_NORMAL_LOW = 1
+FILL_STATE_NORMAL_MID = 2
+FILL_STATE_NORMAL_HIGH = 3
+FILL_STATE_OVER_FULL = 4
+FILL_STATE_UNKNOWN = 5
+
+FILL_STATE_NAMES = {
+    FILL_STATE_LOW: "low",
+    FILL_STATE_NORMAL_LOW: "normal-low",
+    FILL_STATE_NORMAL_MID: "normal-mid",
+    FILL_STATE_NORMAL_HIGH: "normal-high",
+    FILL_STATE_OVER_FULL: "over-full",
+    FILL_STATE_UNKNOWN: "unknown",
+}
+
 # CP2112 HID report IDs used for SMBus/I2C transactions.
 DATA_WRITE_READ = 0x11
 DATA_READ_FORCE_SEND = 0x12
@@ -87,18 +146,14 @@ CANCEL_TRANSFER = 0x17
 BUFFER_CMDS = {
     "off": 0x00,
     "disable": 0x00,
-
     "regular": 0x01,
     "auto": 0x01,
     "normal": 0x01,
     "resume": 0x01,
-
     "hold": 0x02,
     "manual": 0x02,
-
     "push": 0x03,
     "feed": 0x03,
-
     "retract": 0x04,
     "pull": 0x04,
 }
@@ -116,13 +171,13 @@ MODE_NAMES = {
 }
 
 # Reported motor state names read from REG_MOTOR.
-# The lll-buffed README lists Motor State as:
-# 0=Push, 1=Retract, 2=Hold, 3=Off.
+# Current firmware enum:
+# 0=Off, 1=Push, 2=Retract, 3=Hold.
 MOTOR_NAMES = {
-    0: "PUSH",
-    1: "RETRACT",
-    2: "HOLD",
-    3: "OFF",
+    0: "OFF",
+    1: "PUSH",
+    2: "RETRACT",
+    3: "HOLD",
 }
 
 # CP2112 transfer status names. These are bridge-level statuses, not buffer modes.
@@ -206,6 +261,110 @@ def rpt(data):
     return bytes(data + [0x00] * (64 - len(data)))
 
 
+def bit_is_set(value, mask):
+    return 1 if (value & mask) else 0
+
+
+#####################################################################
+#                  Moonraker / Klipper Variable Bridge
+#####################################################################
+
+def klipper_quote_string(value):
+    # SET_GCODE_VARIABLE parses VALUE with Python literal_eval after G-code parsing.
+    # A raw VALUE='text' can lose its quote characters during G-code parsing,
+    # so send the VALUE parameter as a double-quoted argument that contains a
+    # single-quoted Python string literal: VALUE="'text'".
+    safe = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return f"\"'{safe}'\""
+
+
+def moonraker_gcode(script, moonraker_url="http://127.0.0.1:7125"):
+    # RUN_SHELL_COMMAND output only prints to the console.
+    # Posting through Moonraker executes SET_GCODE_VARIABLE in Klipper.
+    base = moonraker_url.rstrip("/")
+    encoded_script = urllib.parse.quote(script, safe="")
+    url = f"{base}/printer/gcode/script?script={encoded_script}"
+
+    request = urllib.request.Request(url, data=b"", method="POST")
+
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Moonraker gcode post failed: {exc}") from exc
+
+
+def capture_status_to_klipper(state_macro, buffer_index, status, moonraker_url):
+    # Write decoded CP2112 status into a Klipper gcode_macro variable store.
+    # The storage macro must already exist in Klipper config.
+    #
+    # This is the important bridge that normal RUN_SHELL_COMMAND cannot provide:
+    # shell output is only console text, but Moonraker can execute
+    # SET_GCODE_VARIABLE so delayed_gcode stages can read the values later.
+    sensors_available = int(status.get("sensors_available", 0))
+
+    if sensors_available:
+        sensor_bits = int(status.get("sensor_bits", -1))
+        sensor_bits_hex = f"0x{sensor_bits & 0xFF:02x}"
+        optical1 = int(status.get("optical1", -1))
+        optical2 = int(status.get("optical2", -1))
+        optical3 = int(status.get("optical3", -1))
+        state_code = int(status.get("buffer_state", FILL_STATE_UNKNOWN))
+        state_name = str(status.get("buffer_state_name", "unknown"))
+        sensor_error = ""
+    else:
+        sensor_bits = -1
+        sensor_bits_hex = "unavailable"
+        optical1 = -1
+        optical2 = -1
+        optical3 = -1
+        state_code = FILL_STATE_UNKNOWN
+        state_name = "unknown"
+        sensor_error = str(status.get("sensor_error", "sensor data unavailable"))
+
+    status_byte = int(status.get("status", -1))
+    status_hex = f"0x{status_byte & 0xFF:02x}" if status_byte >= 0 else "unknown"
+
+    # Set valid last so delayed_gcode readers can treat valid=1 as meaning the
+    # full field set below was written for this capture.
+    lines = [
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=valid VALUE=0",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=buffer VALUE={int(buffer_index)}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=addr VALUE={klipper_quote_string(status.get('addr', ''))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=capture_unix VALUE={int(time.time())}",
+
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=status VALUE={status_byte}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=status_hex VALUE={klipper_quote_string(status_hex)}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=filament_present VALUE={int(status.get('filament_present', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=timed_out VALUE={int(status.get('timed_out', -1))}",
+
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=mode VALUE={int(status.get('mode', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=mode_name VALUE={klipper_quote_string(status.get('mode_name', 'UNKNOWN'))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=motor VALUE={int(status.get('motor', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=motor_name VALUE={klipper_quote_string(status.get('motor_name', 'UNKNOWN'))}",
+
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=speed VALUE={float(status.get('speed', -1.0)):.4f}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=timeout VALUE={int(status.get('timeout', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=emptying_timeout VALUE={int(status.get('emptying_timeout', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=hold_timeout VALUE={int(status.get('hold_timeout', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=hold_timeout_en VALUE={int(status.get('hold_timeout_en', -1))}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=multi_press VALUE={int(status.get('multi_press', -1))}",
+
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=sensors_available VALUE={sensors_available}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=sensor_bits VALUE={sensor_bits}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=sensor_bits_hex VALUE={klipper_quote_string(sensor_bits_hex)}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=optical1 VALUE={optical1}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=optical2 VALUE={optical2}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=optical3 VALUE={optical3}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=state VALUE={klipper_quote_string(state_name)}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=state_code VALUE={state_code}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=sensor_error VALUE={klipper_quote_string(sensor_error)}",
+        f"SET_GCODE_VARIABLE MACRO={state_macro} VARIABLE=valid VALUE=1",
+    ]
+
+    moonraker_gcode("\n".join(lines), moonraker_url=moonraker_url)
+
+
 #####################################################################
 #                  CP2112 / lll-buffed Bridge
 #####################################################################
@@ -275,7 +434,6 @@ class BufferBridge:
         # CP2112 can leave stale 0x13/0x16 reports queued.
         # Drain before starting a new transaction so old responses are not misread.
         self.dev.set_nonblocking(True)
-
         deadline = time.time() + timeout_s
         count = 0
 
@@ -290,7 +448,6 @@ class BufferBridge:
 
         self.dev.set_nonblocking(False)
         dprint(f"drained {count} report(s)")
-
         return count
 
     def cancel_transfer(self):
@@ -323,7 +480,6 @@ class BufferBridge:
             status1 = r[2]
             retries = (r[3] << 8) | r[4]
             count = (r[5] << 8) | r[6]
-
             last_status = (status0, status1, retries, count, r)
 
             dprint(
@@ -365,12 +521,7 @@ class BufferBridge:
 
     def force_read_response(self, length):
         # Force CP2112 to emit the 0x13 data response after a write-read request.
-        request = [
-            DATA_READ_FORCE_SEND,
-            (length >> 8) & 0xFF,
-            length & 0xFF,
-        ]
-
+        request = [DATA_READ_FORCE_SEND, (length >> 8) & 0xFF, length & 0xFF]
         dprint(f"FORCE_READ request={request}")
         self.dev.write(rpt(request))
 
@@ -407,7 +558,6 @@ class BufferBridge:
     def read_reg(self, reg, length=1):
         # Read one virtual register or a contiguous register value from lll-buffed.
         self.drain_reports()
-
         request = [
             DATA_WRITE_READ,
             self.addr_cp2112,
@@ -418,7 +568,6 @@ class BufferBridge:
         ]
 
         dprint(f"WRITE_READ request={request}")
-
         self.dev.write(rpt(request))
 
         count = self.wait_transfer_complete()
@@ -453,15 +602,8 @@ class BufferBridge:
             raise RuntimeError(f"CP2112 write payload too long: {len(payload)} bytes")
 
         self.drain_reports()
-
-        request = [
-            DATA_WRITE,
-            self.addr_cp2112,
-            len(payload),
-        ] + payload
-
+        request = [DATA_WRITE, self.addr_cp2112, len(payload)] + payload
         dprint(f"WRITE request={request}")
-
         self.dev.write(rpt(request))
 
         # For CP2112 write transfers, count is received/read bytes.
@@ -485,7 +627,6 @@ class BufferBridge:
         # Stage a 32-bit float write for MOVE_DIST and SPEED.
         payload = list(struct.pack("<f", float(value)))
         dprint(f"STAGED_F32 reg=0x{reg_base:02x} value={value} bytes={payload}")
-
         return self.write_bytes_staged(reg_base, payload)
 
     def write_u32_staged(self, reg_base, value):
@@ -497,8 +638,42 @@ class BufferBridge:
 
         payload = list(struct.pack("<I", value))
         dprint(f"STAGED_U32 reg=0x{reg_base:02x} value={value} bytes={payload}")
-
         return self.write_bytes_staged(reg_base, payload)
+
+    def decode_sensor_status(self, sensor_bits, fill_state):
+        # Raw optical bits are kept separate from the interpreted buffer state.
+        # The firmware owns the physical pattern-to-state interpretation.
+        fill_state_name = FILL_STATE_NAMES.get(fill_state, "unknown")
+        return {
+            "sensors_available": 1,
+            "sensor_bits": sensor_bits,
+            "optical1": bit_is_set(sensor_bits, SENSOR_OPTICAL1),
+            "optical2": bit_is_set(sensor_bits, SENSOR_OPTICAL2),
+            "optical3": bit_is_set(sensor_bits, SENSOR_OPTICAL3),
+            "buffer_state": fill_state,
+            "buffer_state_name": fill_state_name,
+        }
+
+    def read_sensor_status(self, required=False):
+        # Read the raw optical bitfield and interpreted fill state added by the
+        # local firmware extension.
+        #
+        # If required=False, older firmware remains usable and normal status
+        # prints "buffer_sensors=unavailable" instead of failing the command.
+        try:
+            sensor_bits = self.read_u8(REG_SENSOR_BITS)
+            fill_state = self.read_u8(REG_FILL_STATE)
+            return self.decode_sensor_status(sensor_bits, fill_state)
+
+        except Exception as exc:
+            if required:
+                raise RuntimeError(
+                    "sensor registers unavailable; firmware must expose "
+                    f"REG_SENSOR_BITS=0x{REG_SENSOR_BITS:02x} and "
+                    f"REG_FILL_STATE=0x{REG_FILL_STATE:02x}: {exc}"
+                )
+
+            return {"sensors_available": 0, "sensor_error": str(exc)}
 
     def send_command(self, name):
         # Send a one-byte lll-buffed mode/motion command.
@@ -514,7 +689,6 @@ class BufferBridge:
 
         payload = self.write_f32_staged(REG_SPEED, speed)
         readback = self.read_f32(REG_SPEED)
-
         print(f"set speed={speed:.2f} mm/s bytes={payload}")
         print(f"readback speed={readback:.2f} mm/s")
 
@@ -529,7 +703,6 @@ class BufferBridge:
 
         payload = self.write_u32_staged(REG_TIMEOUT, timeout_ms)
         readback = self.read_u32(REG_TIMEOUT)
-
         print(f"set timeout={timeout_ms} ms bytes={payload}")
         print(f"readback timeout={readback} ms")
 
@@ -543,7 +716,6 @@ class BufferBridge:
 
         payload = self.write_u32_staged(REG_EMPTYING_TIMEOUT, timeout_ms)
         readback = self.read_u32(REG_EMPTYING_TIMEOUT)
-
         print(f"set emptying_timeout={timeout_ms} ms bytes={payload}")
         print(f"readback emptying_timeout={readback} ms")
 
@@ -558,17 +730,14 @@ class BufferBridge:
 
         payload = self.write_u32_staged(REG_HOLD_TIMEOUT, timeout_ms)
         readback = self.read_u32(REG_HOLD_TIMEOUT)
-
         print(f"set hold_timeout={timeout_ms} ms bytes={payload}")
         print(f"readback hold_timeout={readback} ms")
 
     def set_hold_timeout_enable(self, enable):
         # Enable/disable hold power-save mode.
         enable = 1 if int(enable) else 0
-
         self.write_reg(REG_HOLD_TIMEOUT_EN, [enable])
         readback = self.read_u8(REG_HOLD_TIMEOUT_EN)
-
         print(f"set hold_timeout_enable={enable}")
         print(f"readback hold_timeout_enable={readback}")
 
@@ -581,7 +750,6 @@ class BufferBridge:
 
         self.write_reg(REG_MULTI_PRESS, [count])
         readback = self.read_u8(REG_MULTI_PRESS)
-
         print(f"set multi_press_count={count}")
         print(f"readback multi_press_count={readback}")
 
@@ -592,7 +760,7 @@ class BufferBridge:
         payload = self.write_f32_staged(REG_MOVE_DIST, distance)
         print(f"sent move distance={distance:.3f} mm bytes={payload}")
 
-    def read_status(self):
+    def read_status(self, include_sensors=True, require_sensors=False):
         # Read both live state and configurable firmware settings.
         # This makes BUFFER_STATUS useful for confirming settings after writes.
         status = self.read_u8(REG_STATUS)
@@ -605,7 +773,8 @@ class BufferBridge:
         hold_timeout_en = self.read_u8(REG_HOLD_TIMEOUT_EN)
         multi_press = self.read_u8(REG_MULTI_PRESS)
 
-        return {
+        result = {
+            "addr": f"0x{self.addr_7bit:02x}",
             "status": status,
             "filament_present": status & 0x01,
             "timed_out": (status >> 1) & 0x01,
@@ -621,10 +790,26 @@ class BufferBridge:
             "multi_press": multi_press,
         }
 
-    def print_status(self):
-        # Console-friendly status output for Mainsail/Klipper shell_command logs.
-        st = self.read_status()
+        if include_sensors:
+            result.update(self.read_sensor_status(required=require_sensors))
 
+        return result
+
+    def print_sensor_status(self, required=True):
+        # Focused sensor-only output for load-loop testing and macro guards.
+        st = self.read_sensor_status(required=required)
+        print("buffer sensors OK")
+        print(f"addr=0x{self.addr_7bit:02x}")
+        print(f"sensor_bits=0x{st['sensor_bits']:02x}")
+        print(f"optical1={st['optical1']}  # raw optical input 1")
+        print(f"optical2={st['optical2']}  # raw optical input 2")
+        print(f"optical3={st['optical3']}  # raw optical input 3")
+        print(f"buffer_state={st['buffer_state_name']}")
+        print(f"buffer_state_code={st['buffer_state']}")
+
+    def print_status(self, require_sensors=False):
+        # Console-friendly status output for Mainsail/Klipper shell_command logs.
+        st = self.read_status(include_sensors=True, require_sensors=require_sensors)
         print("buffer read OK")
         print(f"addr=0x{self.addr_7bit:02x}")
         print(f"status=0x{st['status']:02x}")
@@ -632,12 +817,40 @@ class BufferBridge:
         print(f"timed_out={st['timed_out']}")
         print(f"mode={st['mode']} ({st['mode_name']})")
         print(f"motor={st['motor']} ({st['motor_name']})")
+
+        if st.get("sensors_available"):
+            print(f"sensor_bits=0x{st['sensor_bits']:02x}")
+            print(f"optical1={st['optical1']}  # raw optical input 1")
+            print(f"optical2={st['optical2']}  # raw optical input 2")
+            print(f"optical3={st['optical3']}  # raw optical input 3")
+            print(f"buffer_state={st['buffer_state_name']}")
+            print(f"buffer_state_code={st['buffer_state']}")
+        else:
+            print("buffer_sensors=unavailable")
+            print(f"buffer_sensor_error={st.get('sensor_error', 'unknown')}")
+
         print(f"speed={st['speed']:.2f} mm/s")
         print(f"timeout={st['timeout']} ms")
         print(f"emptying_timeout={st['emptying_timeout']} ms")
         print(f"hold_timeout={st['hold_timeout']} ms")
         print(f"hold_timeout_en={st['hold_timeout_en']}")
         print(f"multi_press={st['multi_press']}")
+
+    def assert_not_over_full(self):
+        # Macro-friendly safety guard.
+        # This fails closed if the sensor state is over-full or unknown.
+        st = self.read_sensor_status(required=True)
+        print(f"buffer_state={st['buffer_state_name']}")
+        print(f"buffer_state_code={st['buffer_state']}")
+        print(f"sensor_bits=0x{st['sensor_bits']:02x}")
+
+        if st["buffer_state"] == FILL_STATE_OVER_FULL:
+            raise RuntimeError("buffer is over-full; refusing to continue feed")
+
+        if st["buffer_state"] == FILL_STATE_UNKNOWN:
+            raise RuntimeError("buffer state is unknown; refusing to continue feed")
+
+        print("buffer_not_over_full=1")
 
 
 #####################################################################
@@ -654,9 +867,10 @@ def build_parser():
         nargs="?",
         default=os.environ.get("BUFFER_CMD", "status").lower(),
         help=(
-            "Action: status, off, disable, auto, regular, normal, resume, "
-            "hold, manual, push, feed, pull, retract, move, speed, set_speed, "
-            "timeout, emptying-timeout, hold-timeout, hold-timeout-enable, multi-press"
+            "Action: status, sensors, capture-state, assert-not-over-full, off, disable, auto, "
+            "regular, normal, resume, hold, manual, push, feed, pull, retract, "
+            "move, speed, set_speed, timeout, emptying-timeout, hold-timeout, "
+            "hold-timeout-enable, multi-press"
         ),
     )
 
@@ -738,6 +952,35 @@ def build_parser():
     )
 
     parser.add_argument(
+        "--require-sensors",
+        action="store_true",
+        default=env_bool("BUFFER_REQUIRE_SENSORS", False),
+        help=(
+            "Fail status if sensor registers are unavailable. "
+            "Env: BUFFER_REQUIRE_SENSORS=1"
+        ),
+    )
+
+    parser.add_argument(
+        "--buffer-index",
+        type=int,
+        default=env_int("BUFFER_INDEX", 0),
+        help="Buffer index written to Klipper state for action=capture-state. Env: BUFFER_INDEX",
+    )
+
+    parser.add_argument(
+        "--state-macro",
+        default=os.environ.get("BUFFER_STATE_MACRO", "_BUFFER_CAPTURE_STATE"),
+        help="Klipper gcode_macro used for action=capture-state. Env: BUFFER_STATE_MACRO",
+    )
+
+    parser.add_argument(
+        "--moonraker-url",
+        default=os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125"),
+        help="Moonraker URL used for action=capture-state. Env: MOONRAKER_URL",
+    )
+
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=env_bool("BUFFER_DEBUG", False),
@@ -754,29 +997,43 @@ def normalize_action(action):
     aliases = {
         "set-speed": "speed",
         "set_speed": "speed",
-
         "moves": "move",
         "move_dist": "move",
         "move-distance": "move",
-
+        "sensor": "sensors",
+        "sensor-status": "sensors",
+        "sensor_status": "sensors",
+        "buffer-state": "sensors",
+        "buffer_state": "sensors",
+        "fill-state": "sensors",
+        "fill_state": "sensors",
+        "capture": "capture-state",
+        "capture_state": "capture-state",
+        "capture-status": "capture-state",
+        "capture_status": "capture-state",
+        "capture-buffer-state": "capture-state",
+        "capture_buffer_state": "capture-state",
+        "assert_not_over_full": "assert-not-over-full",
+        "assert-not-overfull": "assert-not-over-full",
+        "assert_not_overfull": "assert-not-over-full",
+        "require-not-over-full": "assert-not-over-full",
+        "require_not_over_full": "assert-not-over-full",
+        "require-feed-safe": "assert-not-over-full",
+        "require_feed_safe": "assert-not-over-full",
         "set-timeout": "timeout",
         "set_timeout": "timeout",
-
         "emptying_timeout": "emptying-timeout",
         "set-emptying-timeout": "emptying-timeout",
         "set_emptying_timeout": "emptying-timeout",
-
         "hold_timeout": "hold-timeout",
         "set-hold-timeout": "hold-timeout",
         "set_hold_timeout": "hold-timeout",
-
         "hold_timeout_enable": "hold-timeout-enable",
         "hold-timeout-en": "hold-timeout-enable",
         "hold_timeout_en": "hold-timeout-enable",
         "set-hold-timeout-enable": "hold-timeout-enable",
         "set_hold_timeout_enable": "hold-timeout-enable",
         "set_hold_timeout_en": "hold-timeout-enable",
-
         "multi_press": "multi-press",
         "multi-press-count": "multi-press",
         "multi_press_count": "multi-press",
@@ -796,7 +1053,6 @@ def main():
 
     parser = build_parser()
     args = parser.parse_args()
-
     DEBUG = args.debug
 
     action = normalize_action(args.action)
@@ -809,7 +1065,6 @@ def main():
 
     try:
         bridge.open()
-
         print("opened CP2112")
         print(f"target addr 7-bit=0x{addr_7bit:02x}, cp2112=0x{bridge.addr_cp2112:02x}")
 
@@ -817,58 +1072,75 @@ def main():
         bridge.cancel_transfer()
 
         if action == "status":
-            bridge.print_status()
+            bridge.print_status(require_sensors=args.require_sensors)
+            return
+
+        if action == "sensors":
+            bridge.print_sensor_status(required=True)
+            return
+
+        if action == "capture-state":
+            st = bridge.read_status(include_sensors=True, require_sensors=True)
+            st["addr"] = f"0x{addr_7bit:02x}"
+            capture_status_to_klipper(
+                state_macro=args.state_macro,
+                buffer_index=args.buffer_index,
+                status=st,
+                moonraker_url=args.moonraker_url,
+            )
+            print("buffer capture OK")
+            print(f"state_macro={args.state_macro}")
+            print(f"buffer={args.buffer_index}")
+            print(f"addr=0x{addr_7bit:02x}")
+            print(f"sensor_bits=0x{st['sensor_bits']:02x}")
+            print(f"buffer_state={st['buffer_state_name']}")
+            print(f"buffer_state_code={st['buffer_state']}")
+            print(f"filament_present={st['filament_present']}")
+            print(f"mode={st['mode']} ({st['mode_name']})")
+            print(f"motor={st['motor']} ({st['motor_name']})")
+            return
+
+        if action == "assert-not-over-full":
+            bridge.assert_not_over_full()
             return
 
         if action == "speed":
             if args.speed is None:
                 raise RuntimeError("action=speed requires --speed or BUFFER_SPEED")
-
             bridge.set_speed(args.speed)
             return
 
         if action == "timeout":
             if args.timeout_ms is None:
                 raise RuntimeError("action=timeout requires --timeout-ms or BUFFER_TIMEOUT_MS")
-
             bridge.set_timeout_ms(args.timeout_ms)
             return
 
         if action == "emptying-timeout":
             if args.emptying_timeout_ms is None:
                 raise RuntimeError(
-                    "action=emptying-timeout requires "
-                    "--emptying-timeout-ms or BUFFER_EMPTYING_TIMEOUT_MS"
+                    "action=emptying-timeout requires --emptying-timeout-ms or BUFFER_EMPTYING_TIMEOUT_MS"
                 )
-
             bridge.set_emptying_timeout_ms(args.emptying_timeout_ms)
             return
 
         if action == "hold-timeout":
             if args.hold_timeout_ms is None:
-                raise RuntimeError(
-                    "action=hold-timeout requires --hold-timeout-ms or BUFFER_HOLD_TIMEOUT_MS"
-                )
-
+                raise RuntimeError("action=hold-timeout requires --hold-timeout-ms or BUFFER_HOLD_TIMEOUT_MS")
             bridge.set_hold_timeout_ms(args.hold_timeout_ms)
             return
 
         if action == "hold-timeout-enable":
             if args.hold_timeout_enable is None:
                 raise RuntimeError(
-                    "action=hold-timeout-enable requires "
-                    "--hold-timeout-enable or BUFFER_HOLD_TIMEOUT_ENABLE"
+                    "action=hold-timeout-enable requires --hold-timeout-enable or BUFFER_HOLD_TIMEOUT_ENABLE"
                 )
-
             bridge.set_hold_timeout_enable(args.hold_timeout_enable)
             return
 
         if action == "multi-press":
             if args.multi_press_count is None:
-                raise RuntimeError(
-                    "action=multi-press requires --multi-press-count or BUFFER_MULTI_PRESS_COUNT"
-                )
-
+                raise RuntimeError("action=multi-press requires --multi-press-count or BUFFER_MULTI_PRESS_COUNT")
             bridge.set_multi_press_count(args.multi_press_count)
             return
 
@@ -881,8 +1153,7 @@ def main():
 
             if abs(args.distance) > args.max_distance:
                 raise RuntimeError(
-                    f"Refusing move distance {args.distance:.3f} mm; "
-                    f"max is {args.max_distance:.3f} mm"
+                    f"Refusing move distance {args.distance:.3f} mm; max is {args.max_distance:.3f} mm"
                 )
 
             if args.speed is not None:
@@ -890,11 +1161,8 @@ def main():
 
             bridge.move_distance(args.distance)
 
-            # MOVE_DIST leaves the buffer outside native hall-sensor auto logic.
-            # AUTO/REGULAR should be sent later only when intentionally returning
-            # control to the firmware state machine.
             if args.read_after:
-                bridge.print_status()
+                bridge.print_status(require_sensors=args.require_sensors)
 
             return
 
@@ -906,7 +1174,6 @@ def main():
 
             # If push/feed/pull/retract is given with BUFFER_DISTANCE, use the
             # firmware-bounded MOVE_DIST path instead of modal forced motion.
-            # This is safer for macros than indefinite forced motion.
             if is_modal_motion and args.distance is not None:
                 distance = abs(args.distance)
 
@@ -915,8 +1182,7 @@ def main():
 
                 if abs(distance) > args.max_distance:
                     raise RuntimeError(
-                        f"Refusing move distance {distance:.3f} mm; "
-                        f"max is {args.max_distance:.3f} mm"
+                        f"Refusing move distance {distance:.3f} mm; max is {args.max_distance:.3f} mm"
                     )
 
                 if args.speed is not None:
@@ -925,7 +1191,7 @@ def main():
                 bridge.move_distance(distance)
 
                 if args.read_after:
-                    bridge.print_status()
+                    bridge.print_status(require_sensors=args.require_sensors)
 
                 return
 
@@ -933,15 +1199,17 @@ def main():
 
             # Push/feed and pull/retract are modal forced-motion commands.
             # Do not immediately read status afterward unless explicitly requested.
-            # During forced motion, hall sensor logic is ignored until AUTO/REGULAR.
             if is_modal_motion and not args.read_after:
                 return
 
-            bridge.print_status()
+            bridge.print_status(require_sensors=args.require_sensors)
             return
 
         valid = sorted(list(BUFFER_CMDS.keys()) + [
             "status",
+            "sensors",
+            "capture-state",
+            "assert-not-over-full",
             "move",
             "speed",
             "timeout",

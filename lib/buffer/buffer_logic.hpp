@@ -41,6 +41,12 @@ enum I2CRegister : uint8_t {
   REG_PARAM_HOLD_TIMEOUT = 0x14, // 4 bytes (uint32_t)
   REG_PARAM_HOLD_TIMEOUT_ENABLED = 0x18, // 1 byte
   REG_PARAM_MULTI_PRESS_COUNT = 0x19, // 1 byte
+
+  // Local read-only buffer status extension.
+  // REG_SENSOR_BITS exposes raw optical sensor bits from BufferHardware.
+  // REG_FILL_STATE exposes the interpreted buffer range state.
+  REG_SENSOR_BITS = 0x1A, // 1 byte
+  REG_FILL_STATE = 0x1B, // 1 byte
 };
 
 enum I2CCommand : uint8_t {
@@ -77,6 +83,7 @@ private:
     Retract,
     Hold,
   };
+
   struct ButtonState {
     bool pressed{ false };
     uint32_t pressStart{ 0 };
@@ -160,6 +167,7 @@ public:
 
   void loop() {
     hw.loop();
+
 #ifdef ENABLE_UART_PROTOCOL
     processUartCommands();
 #endif
@@ -215,7 +223,7 @@ private:
           cmdBuf[cmdLen] = '\0';
 
           if (cmdBuf[0] >= '0' && cmdBuf[0] <= '9') {
-            // A specific buffer is being addressed: check if it matches ours
+            // A specific buffer is being addressed: check if it matches ours.
             if (const int bufID = cmdBuf[0] - '0'; bufID != hw.getBufferID()) {
               cmdLen = 0;
               continue;
@@ -231,6 +239,7 @@ private:
         }
       }
     }
+
     if (cmdLen > 0 && hw.timeMs() - lastCharTime > CMD_TIMEOUT) {
       cmdLen = 0;
     }
@@ -254,6 +263,7 @@ private:
 
   void handleUartCommand(const char *cmd) {
     const char *arg = nullptr;
+
     if (strcmp(cmd, "push") == 0 || strcmp(cmd, "p") == 0) {
       if (!hw.filamentPresent())
         return;
@@ -303,6 +313,7 @@ private:
     } else if ((arg = startsWith(cmd, "set_", "emptying_", "timeout", " ", nullptr))) {
       emptyingPushTimeoutMs = tiny::strtoul(arg);
     }
+
     updateStatus();
   }
 #endif
@@ -348,6 +359,10 @@ private:
       return hw.i2cWrite(holdTimeoutEnabled ? 1 : 0);
     case REG_PARAM_MULTI_PRESS_COUNT:
       return hw.i2cWrite(multiPressCount);
+    case REG_SENSOR_BITS:
+      return hw.i2cWrite(hw.getSensorBits());
+    case REG_FILL_STATE:
+      return hw.i2cWrite(static_cast<uint8_t>(hw.getFillState()));
     default:
       return hw.i2cWrite(0);
     }
@@ -520,9 +535,10 @@ private:
       HW::rebootDFU();
       break;
     default:
-      // Unknown command, ignore;
+      // Unknown command, ignore.
       break;
     }
+
     updateStatus();
   }
 #endif
@@ -537,18 +553,23 @@ private:
       }
       return;
     }
+
     if (!s.pressed) {
       return;
     }
+
     const uint32_t dur = now - s.pressStart;
     s.pressed = false;
+
     if (dur <= SHORT_PRESS_MS) {
       if (now - s.lastRelease >= MULTI_PRESS_MIN_MS && now - s.lastRelease <= MULTI_PRESS_MAX_MS) {
         ++s.count;
       } else {
         s.count = 1;
       }
+
       s.lastRelease = now;
+
       if (s.count >= multiPressCount) {
         if (hw.filamentPresent()) {
           setMode(Mode::Continuous);
@@ -557,6 +578,7 @@ private:
         s.count = 0;
         return;
       }
+
       holdTimeoutEnabled = false;
       if (hw.filamentPresent()) {
         setMode(Mode::Hold);
@@ -576,11 +598,13 @@ private:
       }
     }
   }
+
   void handleButtons() {
     const uint32_t now = hw.timeMs();
     doHandleButton(hw.buttonForward(), Motor::Push, btnFwd, now);
     doHandleButton(hw.buttonBackward(), Motor::Retract, btnBack, now);
   }
+
   void handleRegular() {
     if (!hw.filamentPresent()) {
       if (lastFilament) {
@@ -593,15 +617,19 @@ private:
     }
 
     bool move = false;
+
     if (hw.optical1()) {
+      // Low buffer position: feed filament toward the toolhead side.
       setMotor(Motor::Push);
       moveStart = hw.timeMs();
       move = true;
     } else if (hw.optical3()) {
+      // Over-extended buffer position: retract filament toward the spool side.
       setMotor(Motor::Retract);
       moveStart = hw.timeMs();
       move = true;
     } else if (hw.optical2()) {
+      // Center/settled position: hold the buffer if the motor was previously active.
       if (motor != Motor::Off) {
         setMotor(Motor::Hold);
       }
@@ -609,6 +637,7 @@ private:
 
     if (motor == Motor::Push || motor == Motor::Retract) {
       if (!move && hw.timeMs() - moveStart >= timeoutMs) {
+        // Movement was commanded but no sensor state refreshed the motion timer.
         timedOut = true;
         setMode(Mode::Hold);
         setMotor(Motor::Hold);
@@ -630,26 +659,27 @@ private:
       return;
     }
 
-    // Work similarly to regular mode
     if (hw.optical1() || (motor == Motor::Push && !hw.optical1() && !hw.optical2() && !hw.optical3())) {
+      // Continue pushing while emptying so the remaining filament tail can leave the buffer path.
       if (motor != Motor::Push || emptyingPushStart == 0) {
         emptyingPushStart = hw.timeMs();
       }
       setMotor(Motor::Push);
     } else if (hw.optical2()) {
+      // Center/settled position during emptying.
       setMotor(Motor::Hold);
     } else if (hw.optical3()) {
+      // Over-extended position during emptying.
       setMotor(Motor::Retract);
     }
 
-    // If we've been pushing without moving for a while, assume the tail of the filament has left the gear and
-    // therefore the spring is no longer under tension
     if (motor == Motor::Push && emptyingPushTimeoutMs > 0 && hw.timeMs() - emptyingPushStart >= emptyingPushTimeoutMs) {
+      // Stop emptying after the tail-push window expires.
       setMode(Mode::Regular);
       setMotor(Motor::Off);
     }
   }
-
+  
   void handleMoveCommand() {
     if (hw.timeMs() >= moveEnd) {
       if (hw.filamentPresent()) {
@@ -672,6 +702,7 @@ private:
       }
       return;
     }
+
     if (timeoutMs > 0 && hw.timeMs() - continuousStart >= timeoutMs) {
       setMode(Mode::Hold);
       setMotor(Motor::Hold);
@@ -682,6 +713,7 @@ private:
     if (!holdTimeoutEnabled || motor != Motor::Hold) {
       return;
     }
+
     if (hw.timeMs() - holdStart >= holdTimeoutMs) {
       setMode(Mode::Regular);
       setMotor(Motor::Off);
@@ -766,6 +798,7 @@ private:
       lastEmptyingPushTimeoutMs = emptyingPushTimeoutMs;
     }
 #endif
+
 #ifdef ENABLE_I2C_PROTOCOL
     bool changed = false;
     if (hw.filamentPresent() != lastFilament || force)
@@ -799,7 +832,9 @@ private:
     if (motor == m) {
       return;
     }
+
     motor = m;
+
     switch (motor) {
     case Motor::Push:
       hw.stepperPush(speedMmS);
@@ -821,6 +856,7 @@ private:
     if (mode == m) {
       return;
     }
+
     const uint32_t now = hw.timeMs();
 
     switch (m) {
