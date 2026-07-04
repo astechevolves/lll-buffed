@@ -1,173 +1,154 @@
-# LLL Buffed - Mellow LLL Plus Custom Firmware
+## AsTechEvolves Fork Changes
 
-This is a custom firmware for the Mellow LLL Plus 3D printer filament buffer.
+******* Note - I totally cheated and AI write a summary of changes between the OG fork and what i ended up with so i can come back later and comb through to make sure it's right and clear before posting it all ******
 
-In addition to the original firmware, this firmware implements the following additional features:
 
-- **Filament hold**: When pressing a button briefly, the buffer will hold the filament in place.
-- **Continuous run mode**: When a button is double-pressed (or triple-pressed, configurable), the buffer will
-  continuously run the motor until a button is pressed again or the timeout (default 1m 30s, configurable) is reached.
-  On timeout, the buffer will hold the filament in place.
-- **Serial commands and status**: The buffer can be controlled via serial commands, and it provides status updates
-  on the current state of the buffer. This allows implementing useful functionality such as assisted loading/unloading
-  of filament.
-- **Power save mode**: When controlled via serial commands, a power save mode can be enabled that turns off the motor
-  after a few seconds of inactivity. Read more about this later in the document.
+This fork extends `lll-buffed` for CP2112-controlled Klipper / Moonraker toolchanger use, with a focus on multi-buffer routing, safer host-side movement commands, status capture, and Raspberry Pi 5 CP2112 setup.
 
-### Installation
+In addition to the upstream firmware features, this fork adds the following high-level features:
 
-To install the firmware, you will need to use PlatformIO Core. Follow the
-official [PlatformIO installation instructions](https://platformio.org/install/cli).
+* **CP2112 USB-to-I2C control helper**: Adds a Python helper for controlling one or more `lll-buffed` buffers through a Silicon Labs CP2112 HID USB-to-SMBus bridge instead of relying only on UART.
+* **Klipper macro examples for CP2112 buffers**: Adds example Klipper macro wrappers for calling the CP2112 helper from `RUN_SHELL_COMMAND`.
+* **Toolchanger buffer routing examples**: Adds active-tool buffer routing macros so toolhead actions can be mapped to numbered buffer macros such as `BUFFER_AUTO_0`, `BUFFER_MOVE_0`, `BUFFER_STATUS_0`, etc.
+* **Multi-buffer support pattern**: Adds a central tool-to-buffer map intended for setups with multiple buffers, such as Buffer0 through Buffer4.
+* **Firmware-bounded buffer moves**: Adds host-side macro examples for distance-limited buffer movement using the firmware `MOVE_DIST` register instead of open-ended forced push/retract motion.
+* **Runtime buffer status capture**: Adds support for capturing decoded buffer state into Klipper `gcode_macro` variables through Moonraker, allowing later macro logic to read the last known buffer state.
+* **Raw optical sensor readback**: Adds firmware and helper support for reading raw optical sensor bits.
+* **Interpreted buffer fill state**: Adds firmware and helper support for decoded fill states such as `low`, `normal-low`, `normal-mid`, `normal-high`, `over-full`, and `unknown`.
+* **CP2112 communication health checks**: Adds a quiet buffer communication validator intended to print nothing on success and a clear error on failure.
+* **Raspberry Pi 5 CP2112 setup notes**: Adds recovery/setup documentation for CP2112 HID permissions, `hidapi`, and udev rules on Raspberry Pi OS / Klipper systems.
 
-1. Clone this repository to your local machine:
+## Basic Configuration Changes
 
-   ```bash
-   git clone https://github.com/depau/lll-buffed.git
-   cd lll-buffed
-   ```
+### PlatformIO
 
-2. Unscrew and remove the top cover of the buffer, and connect the device to your computer via USB.
-3. While holding the `B` (boot) button on the buffer, press and release the `R` (reset) button to put the device into
-   bootloader mode. They are located on the PCB between the push/retract buttons. I usually press the `B` button with
-   one side of the finger, then rotate the same finger to press and release the `R` button with the other side of the
-   finger.
-4. Build and upload the firmware using PlatformIO:
+The default firmware build still enables UART and I2C support, with the default I2C address remaining `0x10`.
 
-   ```bash
-   pio run -e fly_buffer_f072c8 -t upload
-   ```
+For multiple buffers, each buffer should be flashed with a unique I2C address, for example:
 
-If PlatformIO complains that it cannot find the device, try again putting the device into bootloader mode, it may take a
-few tries to get the technique right.
+```ini
+-D I2C_ADDR=0x10
+-D I2C_ADDR=0x11
+-D I2C_ADDR=0x12
+-D I2C_ADDR=0x13
+-D I2C_ADDR=0x14
+```
 
-### Serial Commands
+The fork also keeps `BUFFER_ID` support for UART-addressed buffers.
 
-The buffer can be controlled via serial commands sent over the UART interface.
+### CP2112 / Klipper Helper Setup
 
-The protocol is enabled via `ENABLE_UART_PROTOCOL` in `platformio.ini`. TX is on `PA2`, RX is on `PA3`. The baud rate
-is 115200.
+The added CP2112 helper expects the Silicon Labs CP2112 USB HID-to-I2C bridge:
 
-Most commands have short aliases for convenience. The commands are:
+```text
+USB ID: 10c4:ea90
+```
 
-- `push` (`p`): Push the filament forward (continuous run mode).
-- `retract` (`r`): Retract the filament (continuous run mode).
-- `hold` (`h`): Hold the filament in place.
-- `regular` (`n`): Switch to regular mode (push/retract based on sensor inputs).
-- `off` (`o`): Switch to regular mode; if the filament is to be held, the motor is turned off instead. (This will be
-  reset next time filament is pushed or retracted)
-- `move <+/-distance>` (`m <+/-distance>`): Move the buffer a fixed distance in millimeters. A negative distance means
-  retracting the filament. After the move, the buffer will hold the filament in place.
-- `query` (`q`): Query the current state of the buffer.
+The helper scripts are intended to run from the Klipper Python environment:
 
-A few commands allow tweaking the buffer settings. **The settings are stored in RAM**, so the host software will have
-to reapply them after a power cycle.
+```bash
+~/klippy-env/bin/python
+```
 
-- `set_timeout <MS>`: Set the timeout for the continuous run and regular modes in milliseconds. Default is 90000 (1
-  minute 30 seconds).
-- `set_hold_timeout <MS>`: Set the hold timeout in milliseconds. Default is 10000 (10 seconds).
-- `set_hold_timeout_en <0|1>`: Enable or disable the hold timeout (power save mode). Default is 0 (disabled).
-- `set_emptying_timeout <MS>`: Set the timeout after which the buffer will shut down when no filament is detected.
-  Default is 5000 (5 seconds).
-- `set_multi_press_count <N>`: Set the number of button presses required to enter continuous run mode. Default is 2.
-- `set_speed <MM/S>`: Set the speed of the motor in millimeters per second. Default is 30.
+The added setup notes include installing HID dependencies, installing `hidapi`, verifying that the CP2112 can be opened by the normal user, and applying udev rules if the device only works with `sudo`.
 
-When the status or the settings change, the buffer will send a status update over serial. The status updates are the
-following:
+### Klipper Shell Commands
 
-- `mode=<mode>`: The current mode of the buffer. Possible values are:
-  - `regular`: Automatic operation based on the optical sensors.
-  - `continuous`: Continuous run mode started by a command or a sequence of button presses.
-  - `move_command`: Move for a fixed distance issued by the host.
-  - `hold`: Filament held in place with the motor enabled, ignoring sensor inputs.
-  - `manual`: Motor controlled directly by a held button.
-  - `emptying`: The buffer is waiting for the last bit of filament to be pushed out after the filament has run out.
-- `status=<status>`: The current status of the motor. Possible values are:
-  - `push`: Filament pushed forward.
-  - `retract`: Filament retracted.
-  - `hold`: Motor enabled with zero velocity, either in hold mode or when the buffer is idle in regular mode.
-  - `off`: Driver disabled.
-- `filament_present=<0|1>`: Whether the filament is present in the buffer (i.e., the sensors detect it).
-- `timed_out=<0|1>`: Whether the buffer has timed out in continuous run or regular mode.
-- `timeout=<MS>`: The current configured timeout in milliseconds.
-- `hold_timeout=<MS>`: The current configured hold timeout in milliseconds (power save mode).
-- `hold_timeout_en=<0|1>`: Whether the hold timeout (power save mode) is enabled.
-- `emptying_timeout=<MS>`: The current configured emptying timeout in milliseconds.
-- `multi_press_count=<N>`: The number of button presses required to enter continuous run mode.
-- `speed=<MM/S>`: The current speed of the motor in millimeters per second.
+The fork adds example shell-command wiring for calling the CP2112 helper from Klipper macros. Typical commands include:
 
-Commands may be prefixed by a single digit representing the buffer ID (0-9) if multiple buffers are connected to the
-same UART TX line. You can change the buffer ID by modifying the `BUFFER_ID` macro in `platformio.ini`.
+```text
+lll_buffer_cp2112
+lll_buffer_cp2112_verbose
+lll_buffer_cp2112_check
+```
 
-### Timeout
+The quiet check helper is intended for startup or pre-print checks. It should remain silent on success and report a loud `BUFFER COMMS ERROR` on failure.
 
-In regular mode, the buffer will keep pushing or retracting the filament until the sensors detect that the buffer is
-empty or full. In continuous run mode, the buffer will keep pushing or retracting the filament until a button is
-pressed.
+### Buffer Macro Structure
 
-If the buffer does not receive any input (user or sensor) for a certain amount of time, it will time out and hold the
-filament in place.
+The added macro examples use numbered buffer macro names, such as:
 
-This is to prevent the buffer from running indefinitely if the sensors are not detecting the filament correctly or if
-the user forgets to stop the buffer.
+```text
+BUFFER_AUTO_0
+BUFFER_OFF_0
+BUFFER_MOVE_0
+BUFFER_STATUS_0
+BUFFER_CAPTURE_0
+BUFFER_APPLY_DEFAULTS_0
+```
 
-Timeouts are reset by any user input (button press) or via serial commands (i.e. `regular`, `push`, `retract`).
+The active-tool routing examples then map the current active extruder to the matching buffer number and call the correct numbered macro.
 
-### Power Save Mode
+Example mapping pattern:
 
-When the buffer is controlled via serial commands, it can enter a power save mode that turns off the motor after a few
-seconds of inactivity.
+```text
+T0 -> Buffer0
+T1 -> Buffer1
+T2 -> Buffer2
+T3 -> Buffer3
+T4 -> Buffer4
+```
 
-This is disabled by default since it can be annoying when operating the buffer manually. The idea is that the printer
-host software should enable it when its own filament sensor detects the filament, since when the filament is in all the
-way there's no need to hold it in place with the motor.
+### Buffer0 Defaults Example
 
-Operating the buffer manually will disable the power save mode, so the filament won't suddenly start moving after
-stopping it manually.
+The included Buffer0 macro example centralizes defaults in `_LLL_BUFFER_VARS_0`, including:
 
-### I2C Protocol
+```text
+addr: 0x10
+default_speed: 60.0 mm/s
+default_timeout_ms: 60000
+default_emptying_timeout_ms: 2500
+default_hold_timeout_ms: 10000
+default_hold_timeout_enable: 1
+default_multi_press_count: 2
+max_speed: 80.0 mm/s
+max_move_distance: 2000.0 mm
+move_settle_ms: 250
+```
 
-The buffer can also be controlled via I2C. This is enabled via `ENABLE_I2C_PROTOCOL` in `platformio.ini`. The default Address is `0x10`.
+These values are used by `BUFFER_APPLY_DEFAULTS_0` so firmware RAM-only settings can be reapplied after buffer power cycle, Klipper restart, or printer startup.
 
-**Hardware Connections:**
+### New Status Data
 
-- **SDA**: PB11
-- **SCL**: PB10
-- **Interrupt (INT)**: PA5 (Open-Drain, Active Low)
+The fork adds readback support for both raw and interpreted buffer state.
 
-**Operation:**
-The I2C protocol uses a Virtual Register Map. The Master writes to registers to send commands or configure parameters, and reads from registers to get status.
-The **Interrupt Line (INT)** is asserted (pulled LOW) by the buffer whenever its status changes (e.g. filament status, mode change, timeout). The Master should read the `STATUS` register to clear the interrupt.
+Raw sensor data:
 
-**Data Encoding:**
+```text
+sensor_bits
+optical1
+optical2
+optical3
+```
 
-- **Endianness**: Little Endian (LSB first).
-- **Floats**: IEEE 754 Single Precision (32-bit).
-- **Integers**: Two's complement (32-bit or 8-bit).
-- **Booleans**: 1 byte, `0x00` = False, `0x01` = True.
+Interpreted buffer state:
 
-**Register Map:**
+```text
+low
+normal-low
+normal-mid
+normal-high
+over-full
+unknown
+```
 
-| Register             | Address | Bytes | R/W | Description                                                                  |
-|:---------------------|:--------|:------|:----|:-----------------------------------------------------------------------------|
-| **COMMAND**          | `0x00`  | 1     | W   | Write command code: `0`=Off, `1`=Regular, `2`=Hold, `3`=Push, `4`=Retract    |
-| **MOVE_DIST**        | `0x01`  | 4     | W   | Float — trigger a move (mm). Positive=Push, Negative=Retract.                |
-| **STATUS**           | `0x05`  | 1     | R   | Status flags: `Bit0`=FilamentPresent, `Bit1`=TimedOut                        |
-| **MODE**             | `0x06`  | 1     | R   | Current Mode: `0`=Regular, `1`=Continuous, `2`=MoveCmd, `3`=Hold, `4`=Manual |
-| **MOTOR**            | `0x07`  | 1     | R   | Motor State: `0`=Push, `1`=Retract, `2`=Hold, `3`=Off                        |
-| **SPEED**            | `0x08`  | 4     | R/W | Motor speed in mm/s (float)                                                  |
-| **TIMEOUT**          | `0x0C`  | 4     | R/W | Timeout in ms (uint32)                                                       |
-| **EMPTYING_TIMEOUT** | `0x10`  | 4     | R/W | Emptying push timeout in ms (uint32)                                         |
-| **HOLD_TIMEOUT**     | `0x14`  | 4     | R/W | Hold timeout in ms (uint32)                                                  |
-| **HOLD_TIMEOUT_EN**  | `0x18`  | 1     | R/W | Enable hold timeout (0 or 1)                                                 |
-| **MULTI_PRESS**      | `0x19`  | 1     | R/W | Multi-press count                                                            |
+The interpreted states are meant to make macro logic easier and safer than working only from raw optical sensor bits.
 
-**Example Transaction:**
+### Motion Safety Changes
 
-1. Master detects INT LOW.
-2. Master writes `0x05` (STATUS Register Address).
-3. Master reads 1 byte (Status flags). **INT line is released.**
-4. Master checks flags (e.g., Filament Present).
+The macro examples separate bounded movement from modal forced movement.
 
-To trigger a move:
+Preferred normal macro motion:
 
-1. Master writes `[0x01] [Float Byte 0] [Float Byte 1] [Float Byte 2] [Float Byte 3]`.
+```text
+BUFFER_MOVE_0 DISTANCE=<mm> SPEED=<mm/s> WAIT=1 AUTO=1
+```
+
+Manual/debug modal motion requires confirmation:
+
+```text
+BUFFER_PUSH_0 CONFIRM=1
+BUFFER_PULL_0 CONFIRM=1
+```
+
+This keeps normal load/unload logic on bounded `MOVE_DIST` moves while still leaving forced push/pull available for testing.
