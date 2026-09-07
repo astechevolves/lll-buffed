@@ -1,5 +1,32 @@
 ## AsTechEvolves Fork Changes
 
+My notes for later expanding:
+
+Many mods were done to the LLL Plus buffer.
+https://3dmellow.com/products/mellow-lll-plus-filament-buffer-for-diy-3d-printers-klipper-rrf-marlin-material-break-detection-automatic-filament-feeding
+
+The first was to mod firmware. I wanted to have things lik the load and unload buffer as automated as i could. 
+
+Some discussion about the process was had on TeamFDM here. 
+https://www.teamfdm.com/forums/topic/7617-faster-printing-requiring-filament-buffer-feeding/page/4/
+
+The I tested the stock firmware which worked fine but i could not talk to it. I tested the Klipper based firmware for them with some mods but the problem that kept happening was that when the extruder would push the head would freeze. This is based on klipper and klipper is single threaded so the multitasking of pushing the buffer and continuing motion were not working well together. 
+
+I then attempted to talk to the buffer via USB which helped but would only work well for one head without adding another USB hub inside the Storon. I instead opted to add a CP2112 I2C bridge and allowing the filament sensors to be addresses and talked to on a common bus. These use a Python helper script for the Klipper Macros to talk to the I2C bus. 
+
+
+Often when the filament was pushing toward the prints a slight misalignment would cause friction and the buffer would fil so the extruder would stop. I wanted that to be a bit harder to do so i adjusted the spring tension by changing the springs. 
+
+uxcell 20Pcs Extension Spring, Stainless Steel Small Springs with Dual Hook Mechanical Compression Spring for Home Furniture Repair 0.5mm Wire Diax5mm ODx15mm Length
+
+https://a.co/d/09DIJl15
+
+A common issue i had was that if the filment were to get jammed and bump a bit more the PTFE tubing would pop out of the Buffer neck. The connector used by Mellow by default has to be the cheapest i have ever seen. I redrew the neck mechanism so i would install a proper ECAS connector in there. 
+
+Redesign the buffer output to take a proper PTFE connector rather than crappy plastic one that will get pushed out all the time. 
+
+https://a.co/d/05FB9M0O
+
 ******* Note - I totally cheated and AI write a summary of changes between the OG fork and what i ended up with so i can come back later and comb through to make sure it's right and clear before posting it all ******
 
 
