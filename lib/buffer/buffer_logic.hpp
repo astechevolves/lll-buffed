@@ -23,8 +23,14 @@ constexpr uint32_t MULTI_PRESS_MAX_MS = 500;
 constexpr uint32_t DEFAULT_TIMEOUT_MS = 90000;
 constexpr uint32_t DEFAULT_HOLD_TIMEOUT_MS = 10000;
 constexpr uint8_t DEFAULT_MULTI_PRESS_COUNT = 2;
+
 constexpr float DEFAULT_SPEED_MM_S = 45.0F;
 constexpr uint32_t DEFAULT_EMPTYING_PUSH_TIMEOUT_MS = 2500;
+
+// Firmware-side prestage defaults.
+// LEVEL=75 maps to the existing normal-high fill state.
+constexpr uint8_t DEFAULT_PRESTAGE_LEVEL = 75;
+constexpr float DEFAULT_PRESTAGE_MAX_TRAVEL_MM = 35.0F;
 
 constexpr size_t UART_CMD_BUF_SIZE = 64;
 
@@ -47,6 +53,10 @@ enum I2CRegister : uint8_t {
   // REG_FILL_STATE exposes the interpreted buffer range state.
   REG_SENSOR_BITS = 0x1A, // 1 byte
   REG_FILL_STATE = 0x1B, // 1 byte
+
+  // User-facing prestage target level, 0-100.
+  // Host-side commands may present text aliases, but firmware stores the numeric level.
+  REG_PARAM_PRESTAGE_LEVEL = 0x1C, // 1 byte
 };
 
 enum I2CCommand : uint8_t {
@@ -55,6 +65,7 @@ enum I2CCommand : uint8_t {
   CMD_HOLD = 2,
   CMD_PUSH = 3,
   CMD_RETRACT = 4,
+  CMD_PRESTAGE = 5,
   CMD_REBOOT_DFU = 0xDF,
 };
 #endif
@@ -73,7 +84,8 @@ public:
     MoveCommand,
     Hold,
     Manual,
-    Emptying
+    Emptying,
+    Prestage
   };
 
 private:
@@ -83,6 +95,34 @@ private:
     Retract,
     Hold,
   };
+
+  static uint8_t levelToFillRank(const uint8_t level) {
+    // Convert a user-facing 0-100 level into the nearest known fill-state rank.
+    // These ranks match the existing BufferFillState enum values provided by the
+    // hardware implementation:
+    //   0 = low
+    //   1 = normal-low
+    //   2 = normal-mid
+    //   3 = normal-high
+    //   4 = over-full
+    if (level <= 12) {
+      return 0;
+    }
+
+    if (level <= 37) {
+      return 1;
+    }
+
+    if (level <= 62) {
+      return 2;
+    }
+
+    if (level <= 87) {
+      return 3;
+    }
+
+    return 4;
+  }
 
   struct ButtonState {
     bool pressed{ false };
@@ -101,6 +141,8 @@ private:
   uint8_t multiPressCount{ DEFAULT_MULTI_PRESS_COUNT };
   float speedMmS{ DEFAULT_SPEED_MM_S };
   uint32_t emptyingPushTimeoutMs{ DEFAULT_EMPTYING_PUSH_TIMEOUT_MS };
+
+  uint8_t prestageLevel{ DEFAULT_PRESTAGE_LEVEL };
 
   bool filamentPresent{ false };
   bool timedOut{ false };
@@ -121,6 +163,13 @@ private:
   uint32_t emptyingStart{ 0 };
   uint32_t emptyingPushStart{ 0 };
 
+  // Prestage mode state.
+  // prestageLevel is the user-facing 0-100 target.
+  // prestageTargetRank is the mapped sensor-state rank used by the movement logic.
+  uint8_t prestageTargetRank{ levelToFillRank(DEFAULT_PRESTAGE_LEVEL) };
+  float prestageTravelMm{ 0.0F };
+  uint32_t prestageLastTick{ 0 };
+
   Mode lastMode{ Mode::Regular };
   Motor lastMotor{ Motor::Off };
   bool lastFilament{ false };
@@ -132,6 +181,7 @@ private:
   uint32_t lastMultiPressCount{ 0 };
   float lastSpeedMmS{ 0.0F };
   uint32_t lastEmptyingPushTimeoutMs{ 0 };
+  uint32_t lastPrestageLevel{ 0 };
 
 #ifdef ENABLE_I2C_PROTOCOL
   // Staged I2C byte writes let CP2112 write float registers using reliable
@@ -198,6 +248,9 @@ public:
       setMotor(Motor::Hold);
       break;
     case Mode::Manual:
+      break;
+    case Mode::Prestage:
+      handlePrestage();
       break;
     }
 
@@ -286,6 +339,11 @@ private:
       setMotor(Motor::Off);
     } else if (strcmp(cmd, "query") == 0 || strcmp(cmd, "q") == 0) {
       updateStatus(true);
+    } else if (strcmp(cmd, "prestage") == 0) {
+      startPrestage(prestageLevel);
+    } else if ((arg = startsWith(cmd, "prestage ", nullptr))) {
+      const uint32_t requestedLevel = tiny::strtoul(arg);
+      startPrestage(static_cast<uint8_t>(requestedLevel > 100 ? 100 : requestedLevel));
     } else if (strcmp(cmd, "reboot_dfu") == 0) {
       hw.writeLineF("mode=dfu");
       HW::rebootDFU();
@@ -363,6 +421,8 @@ private:
       return hw.i2cWrite(hw.getSensorBits());
     case REG_FILL_STATE:
       return hw.i2cWrite(static_cast<uint8_t>(hw.getFillState()));
+    case REG_PARAM_PRESTAGE_LEVEL:
+      return hw.i2cWrite(prestageLevel);
     default:
       return hw.i2cWrite(0);
     }
@@ -497,6 +557,13 @@ private:
       }
       break;
 
+    case REG_PARAM_PRESTAGE_LEVEL:
+      if (size >= 1) {
+        prestageLevel = data[0] > 100 ? 100 : data[0];
+        updateStatus();
+      }
+      break;
+
     default:
       // Unknown register, ignore.
       break;
@@ -516,6 +583,9 @@ private:
         break;
       setMode(Mode::Continuous);
       setMotor(Motor::Retract);
+      break;
+    case CMD_PRESTAGE:
+      startPrestage(prestageLevel);
       break;
     case CMD_HOLD:
       holdTimeoutEnabled = false;
@@ -603,6 +673,83 @@ private:
     const uint32_t now = hw.timeMs();
     doHandleButton(hw.buttonForward(), Motor::Push, btnFwd, now);
     doHandleButton(hw.buttonBackward(), Motor::Retract, btnBack, now);
+  }
+
+  void startPrestage(const uint8_t requestedLevel) {
+    // Clamp the requested target to a real 0-100 percentage before mapping it
+    // to the nearest known fill-state rank.
+    prestageLevel = requestedLevel > 100 ? 100 : requestedLevel;
+    prestageTargetRank = levelToFillRank(prestageLevel);
+
+    // Reset safety tracking for this prestage run.
+    prestageTravelMm = 0.0F;
+    prestageLastTick = hw.timeMs();
+    timedOut = false;
+
+    setMode(Mode::Prestage);
+
+    // Evaluate immediately so command responses are not delayed until the next
+    // loop pass.
+    handlePrestage();
+
+    updateStatus();
+  }
+
+  void handlePrestage() {
+    const uint32_t now = hw.timeMs();
+
+    // Track approximate travel while the motor is actually moving.
+    // This is only a safety cap; the final target is still sensor-state based.
+    if (motor == Motor::Push || motor == Motor::Retract) {
+      const uint32_t deltaMs = now - prestageLastTick;
+      prestageTravelMm += speedMmS * (static_cast<float>(deltaMs) / 1000.0F);
+    }
+
+    prestageLastTick = now;
+
+    if (!hw.filamentPresent()) {
+      // Do not prestage an empty filament path.
+      timedOut = true;
+      setMode(Mode::Regular);
+      setMotor(Motor::Off);
+      return;
+    }
+
+    if (prestageTravelMm >= DEFAULT_PRESTAGE_MAX_TRAVEL_MM) {
+      // Stop before a bad sensor state or bad command can run the buffer too far.
+      timedOut = true;
+      setMode(Mode::Hold);
+      setMotor(Motor::Hold);
+      return;
+    }
+
+    const uint8_t currentRank = static_cast<uint8_t>(hw.getFillState());
+
+    if (currentRank > 4) {
+      // The existing hardware implementation reports unknown as 5.
+      // Unknown states are not safe to chase.
+      timedOut = true;
+      setMode(Mode::Hold);
+      setMotor(Motor::Hold);
+      return;
+    }
+
+    if (currentRank == prestageTargetRank) {
+      // Target reached. Hold here so the host can inspect the final state or
+      // intentionally return the buffer to Regular/AUTO afterward.
+      timedOut = false;
+      setMode(Mode::Hold);
+      setMotor(Motor::Hold);
+      return;
+    }
+
+    if (currentRank < prestageTargetRank) {
+      // Buffer is lower than requested; feed toward the toolhead side.
+      setMotor(Motor::Push);
+    } else {
+      // Buffer is higher than requested; retract toward the spool side.
+      setMotor(Motor::Retract);
+    }
   }
 
   void handleRegular() {
@@ -746,6 +893,9 @@ private:
       case Mode::Emptying:
         modeStr = "emptying";
         break;
+      case Mode::Prestage:
+        modeStr = "prestage";
+        break;
       }
       hw.writeLineF("mode=%s", modeStr);
       lastMode = mode;
@@ -797,6 +947,10 @@ private:
       hw.writeLineF("%s%s=%u", "emptying_", "timeout", emptyingPushTimeoutMs);
       lastEmptyingPushTimeoutMs = emptyingPushTimeoutMs;
     }
+    if (lastPrestageLevel != prestageLevel || force) {
+      hw.writeLineF("prestage_level=%u", prestageLevel);
+      lastPrestageLevel = prestageLevel;
+    }
 #endif
 
 #ifdef ENABLE_I2C_PROTOCOL
@@ -820,6 +974,8 @@ private:
     if (tiny::abs(lastSpeedMmS - speedMmS) > 0.01F || force)
       changed = true;
     if (lastEmptyingPushTimeoutMs != emptyingPushTimeoutMs || force)
+      changed = true;
+    if (lastPrestageLevel != prestageLevel || force)
       changed = true;
 
     if (changed) {
@@ -866,6 +1022,9 @@ private:
     case Mode::Emptying:
       emptyingStart = now;
       emptyingPushStart = 0;
+      break;
+    case Mode::Prestage:
+      prestageLastTick = now;
       break;
     default:
       break;

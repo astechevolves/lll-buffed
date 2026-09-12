@@ -19,6 +19,7 @@ import hid
 #   - state commands: off, auto/regular, hold/manual
 #   - modal debug motion: push/feed, pull/retract
 #   - bounded firmware moves: move by distance
+#   - firmware-side prestage: move to a requested buffer level/state
 #   - settings: speed, timeout, emptying timeout, hold timeout,
 #     hold timeout enable, and multi-press count
 #   - status reads: filament present, timed out, mode, motor, speed,
@@ -39,6 +40,10 @@ import hid
 # Firmware-bounded distance moves:
 #   BUFFER_CMD=move BUFFER_DISTANCE=10  ALLOW_MOTION=1 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #   BUFFER_CMD=move BUFFER_DISTANCE=-10 ALLOW_MOTION=1 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#
+# Firmware-side prestage examples:
+#   BUFFER_CMD=prestage BUFFER_LEVEL=75 ALLOW_MOTION=1 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
+#   BUFFER_CMD=prestage BUFFER_LEVEL=normal-high ALLOW_MOTION=1 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
 #
 # Settings examples:
 #   BUFFER_CMD=speed BUFFER_SPEED=45 ~/klippy-env/bin/python ~/lll_cp2112_buffer.py
@@ -132,6 +137,21 @@ FILL_STATE_NAMES = {
     FILL_STATE_UNKNOWN: "unknown",
 }
 
+DEFAULT_PRESTAGE_LEVEL = 75
+PRESTAGE_WAIT_TIMEOUT_S = 10.0
+PRESTAGE_POLL_INTERVAL_S = 0.10
+
+PRESTAGE_LEVEL_ALIASES = {
+    "low": 0,
+    "normal-low": 25,
+    "mid": 50,
+    "normal-mid": 50,
+    "high": 75,
+    "normal-high": 75,
+    "full": 100,
+    "over-full": 100,
+}
+
 # CP2112 HID report IDs used for SMBus/I2C transactions.
 DATA_WRITE_READ = 0x11
 DATA_READ_FORCE_SEND = 0x12
@@ -143,6 +163,8 @@ CANCEL_TRANSFER = 0x17
 
 # lll-buffed command register values.
 # These commands change firmware mode or start modal forced motion.
+BUFFER_CMD_PRESTAGE = 0x05
+
 BUFFER_CMDS = {
     "off": 0x00,
     "disable": 0x00,
@@ -161,6 +183,8 @@ BUFFER_CMDS = {
 # Reported mode names. These are read from REG_MODE.
 # NOTE: Command 0x02 is called hold/manual in commands, but reported modes
 # can distinguish HOLD and MANUAL depending on firmware state.
+MODE_PRESTAGE = 6
+
 MODE_NAMES = {
     0: "REGULAR",
     1: "CONTINUOUS",
@@ -168,6 +192,7 @@ MODE_NAMES = {
     3: "HOLD",
     4: "MANUAL",
     5: "EMPTYING",
+    MODE_PRESTAGE: "PRESTAGE",
 }
 
 # Reported motor state names read from REG_MOTOR.
@@ -215,6 +240,49 @@ def parse_int_auto(value, default=None):
         return int(value, 16)
 
     return int(value, 10)
+
+
+def parse_prestage_level(value, default=DEFAULT_PRESTAGE_LEVEL):
+    # Accept either numeric percentages or the firmware state names users see in status.
+    # The firmware stores the numeric 0-100 value and rounds it to the nearest state.
+    if value is None or value == "":
+        value = default
+
+    text = str(value).strip().lower().replace("_", "-")
+
+    if text.endswith("%"):
+        text = text[:-1].strip()
+
+    if text in PRESTAGE_LEVEL_ALIASES:
+        return PRESTAGE_LEVEL_ALIASES[text]
+
+    try:
+        level = int(round(float(text)))
+    except ValueError as exc:
+        valid = ", ".join(sorted(PRESTAGE_LEVEL_ALIASES.keys()))
+        raise RuntimeError(f"Invalid prestage level '{value}'. Use 0-100 or one of: {valid}") from exc
+
+    if level < 0 or level > 100:
+        raise RuntimeError(f"prestage level must be between 0 and 100, got {level}")
+
+    return level
+
+
+def prestage_level_to_state(level):
+    # Match the firmware's 0/25/50/75/100 nearest-step mapping.
+    if level <= 12:
+        return FILL_STATE_LOW
+
+    if level <= 37:
+        return FILL_STATE_NORMAL_LOW
+
+    if level <= 62:
+        return FILL_STATE_NORMAL_MID
+
+    if level <= 87:
+        return FILL_STATE_NORMAL_HIGH
+
+    return FILL_STATE_OVER_FULL
 
 
 def env_bool(name, default=False):
@@ -753,6 +821,84 @@ class BufferBridge:
         print(f"set multi_press_count={count}")
         print(f"readback multi_press_count={readback}")
 
+    def set_prestage_level(self, level):
+        # Set firmware-side prestage target as a user-facing 0-100 level.
+        # Firmware rounds this to the nearest known buffer state.
+        level = int(level)
+
+        if level < 0 or level > 100:
+            raise RuntimeError("prestage level must be between 0 and 100")
+
+        self.write_reg(REG_PARAM_PRESTAGE_LEVEL, [level])
+        readback = self.read_u8(REG_PARAM_PRESTAGE_LEVEL)
+
+        if readback != level:
+            raise RuntimeError(f"prestage level readback mismatch: wrote {level}, read {readback}")
+
+        target_state = prestage_level_to_state(level)
+        print(f"set prestage_level={level} target_state={FILL_STATE_NAMES.get(target_state, 'unknown')}")
+
+    def wait_prestage_complete(self, target_state):
+        # Wait for firmware-side prestage to finish before the Klipper macro continues.
+        # The firmware exits PRESTAGE by entering HOLD on success or fail.
+        deadline = time.time() + PRESTAGE_WAIT_TIMEOUT_S
+        saw_prestage = False
+        last = None
+
+        while time.time() < deadline:
+            st = self.read_status(include_sensors=True, require_sensors=True)
+            last = st
+
+            if st["mode"] == MODE_PRESTAGE:
+                saw_prestage = True
+                time.sleep(PRESTAGE_POLL_INTERVAL_S)
+                continue
+
+            # If the buffer was already at the target when the command was sent,
+            # firmware may complete before the host sees PRESTAGE mode.
+            if st["buffer_state"] == target_state and not st["timed_out"]:
+                return st
+
+            if saw_prestage:
+                raise RuntimeError(
+                    "prestage ended before reaching target: "
+                    f"target={FILL_STATE_NAMES.get(target_state, 'unknown')} "
+                    f"state={st.get('buffer_state_name', 'unknown')} "
+                    f"mode={st.get('mode_name', 'UNKNOWN')} "
+                    f"timed_out={st.get('timed_out', -1)}"
+                )
+
+            # Do not immediately fail on a stale timed_out bit from a previous command;
+            # give firmware time to receive CMD_PRESTAGE and clear timedOut.
+            time.sleep(PRESTAGE_POLL_INTERVAL_S)
+
+        if last is None:
+            raise RuntimeError("prestage timeout with no status readback")
+
+        raise RuntimeError(
+            "prestage wait timeout: "
+            f"target={FILL_STATE_NAMES.get(target_state, 'unknown')} "
+            f"state={last.get('buffer_state_name', 'unknown')} "
+            f"mode={last.get('mode_name', 'UNKNOWN')} "
+            f"timed_out={last.get('timed_out', -1)}"
+        )
+
+    def prestage(self, level):
+        # Start the firmware-side prestage command and wait for a known-good result.
+        target_state = prestage_level_to_state(level)
+        self.set_prestage_level(level)
+        self.write_reg(REG_COMMAND, [BUFFER_CMD_PRESTAGE])
+        print(f"sent prestage level={level} target_state={FILL_STATE_NAMES.get(target_state, 'unknown')}")
+
+        st = self.wait_prestage_complete(target_state)
+        print("prestage complete")
+        print(f"addr=0x{self.addr_7bit:02x}")
+        print(f"buffer_state={st['buffer_state_name']}")
+        print(f"buffer_state_code={st['buffer_state']}")
+        print(f"filament_present={st['filament_present']}")
+        print(f"mode={st['mode']} ({st['mode_name']})")
+        print(f"motor={st['motor']} ({st['motor_name']})")
+
     def move_distance(self, distance):
         # Trigger firmware-bounded MOVE_DIST.
         # Positive = push/feed toward the hotend.
@@ -761,8 +907,6 @@ class BufferBridge:
         print(f"sent move distance={distance:.3f} mm bytes={payload}")
 
     def read_status(self, include_sensors=True, require_sensors=False):
-        # Read both live state and configurable firmware settings.
-        # This makes BUFFER_STATUS useful for confirming settings after writes.
         status = self.read_u8(REG_STATUS)
         mode = self.read_u8(REG_MODE)
         motor = self.read_u8(REG_MOTOR)
@@ -808,7 +952,6 @@ class BufferBridge:
         print(f"buffer_state_code={st['buffer_state']}")
 
     def print_status(self, require_sensors=False):
-        # Console-friendly status output for Mainsail/Klipper shell_command logs.
         st = self.read_status(include_sensors=True, require_sensors=require_sensors)
         print("buffer read OK")
         print(f"addr=0x{self.addr_7bit:02x}")
@@ -869,7 +1012,7 @@ def build_parser():
         help=(
             "Action: status, sensors, capture-state, assert-not-over-full, off, disable, auto, "
             "regular, normal, resume, hold, manual, push, feed, pull, retract, "
-            "move, speed, set_speed, timeout, emptying-timeout, hold-timeout, "
+            "prestage, move, speed, set_speed, timeout, emptying-timeout, hold-timeout, "
             "hold-timeout-enable, multi-press"
         ),
     )
@@ -891,7 +1034,17 @@ def build_parser():
         "--speed",
         type=float,
         default=env_float("BUFFER_SPEED"),
-        help="Speed in mm/s for action=speed/set_speed, or optional pre-set before move.",
+        help="Speed in mm/s for action=speed/set_speed, or optional pre-set before move/prestage.",
+    )
+
+    parser.add_argument(
+        "--level",
+        default=os.environ.get("BUFFER_LEVEL", os.environ.get("BUFFER_PRESTAGE_LEVEL", str(DEFAULT_PRESTAGE_LEVEL))),
+        help=(
+            "Prestage target level for action=prestage. Accepts 0-100 or text such as "
+            "low, normal-low, mid, normal-mid, high, normal-high, full, over-full. "
+            "Env: BUFFER_LEVEL or BUFFER_PRESTAGE_LEVEL"
+        ),
     )
 
     parser.add_argument(
@@ -1000,6 +1153,8 @@ def normalize_action(action):
         "moves": "move",
         "move_dist": "move",
         "move-distance": "move",
+        "pre-stage": "prestage",
+        "pre_stage": "prestage",
         "sensor": "sensors",
         "sensor-status": "sensors",
         "sensor_status": "sensors",
@@ -1144,6 +1299,18 @@ def main():
             bridge.set_multi_press_count(args.multi_press_count)
             return
 
+        if action == "prestage":
+            if not args.allow_motion:
+                raise RuntimeError("action=prestage requires --allow-motion or ALLOW_MOTION=1")
+
+            level = parse_prestage_level(args.level)
+
+            if args.speed is not None:
+                bridge.set_speed(args.speed)
+
+            bridge.prestage(level)
+            return
+
         if action == "move":
             if args.distance is None:
                 raise RuntimeError("action=move requires --distance or BUFFER_DISTANCE")
@@ -1210,6 +1377,7 @@ def main():
             "sensors",
             "capture-state",
             "assert-not-over-full",
+            "prestage",
             "move",
             "speed",
             "timeout",

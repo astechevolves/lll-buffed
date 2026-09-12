@@ -1,22 +1,26 @@
 ## AsTechEvolves Fork Changes
 
-******* Note - I totally cheated and AI write a summary of changes between the OG fork and what i ended up with so i can come back later and comb through to make sure it's right and clear before posting it all ******
+This fork extends `lll-buffed` for CP2112-controlled Klipper / Moonraker toolchanger use, with a focus on multi-buffer routing, safer host-side movement commands, status capture, and control ia an I2C bridge like [CP2112](https://a.co/d/00Z4VKH1). 
 
+In addition to the upstream firmware features, this fork adds the following::
 
-This fork extends `lll-buffed` for CP2112-controlled Klipper / Moonraker toolchanger use, with a focus on multi-buffer routing, safer host-side movement commands, status capture, and Raspberry Pi 5 CP2112 setup.
+Adds CP2112 USB-to-I²C control for operating the buffers from Klipper on a Raspberry Pi.
+Adds multi-buffer/toolchanger support, with individually addressed buffers and example routing macros.
+Adds a full Klipper-side command set for auto, off, hold, push, retract, bounded-distance moves, speed, and timeout settings.
+Adds safer bounded movement, including motion confirmation, maximum-distance limits, and automatic return to normal buffer operation.
+Adds readback of all three raw optical sensors.
+Adds decoded buffer-fill states: low, normal-low, normal-mid, normal-high, over-full, and unknown.
+Adds a fail-closed over-full safety check that can prevent additional feeding when the buffer is full or its sensor state is unknown.
+Adds Moonraker state capture, allowing buffer status and sensor data to be stored in Klipper macro variables.
+Adds a quiet buffer communication health check for startup or pre-print validation.
+Raises the firmware’s default buffer speed from 30 to 45 mm/s.
+Adds Raspberry Pi 5 setup instructions, CP2112 permissions/udev guidance, and complete example macros.
+Documents the physical upgrades: stronger buffer springs and a redesigned output neck using a proper ECAS PTFE connector.
 
-In addition to the upstream firmware features, this fork adds the following high-level features:
+## Examples
+Current versions of operational macros using the below listed features can be found at my [KlipperBackup](https://github.com/astechevolves/KlipperBackup)
 
-* **CP2112 USB-to-I2C control helper**: Adds a Python helper for controlling one or more `lll-buffed` buffers through a Silicon Labs CP2112 HID USB-to-SMBus bridge instead of relying only on UART.
-* **Klipper macro examples for CP2112 buffers**: Adds example Klipper macro wrappers for calling the CP2112 helper from `RUN_SHELL_COMMAND`.
-* **Toolchanger buffer routing examples**: Adds active-tool buffer routing macros so toolhead actions can be mapped to numbered buffer macros such as `BUFFER_AUTO_0`, `BUFFER_MOVE_0`, `BUFFER_STATUS_0`, etc.
-* **Multi-buffer support pattern**: Adds a central tool-to-buffer map intended for setups with multiple buffers, such as Buffer0 through Buffer4.
-* **Firmware-bounded buffer moves**: Adds host-side macro examples for distance-limited buffer movement using the firmware `MOVE_DIST` register instead of open-ended forced push/retract motion.
-* **Runtime buffer status capture**: Adds support for capturing decoded buffer state into Klipper `gcode_macro` variables through Moonraker, allowing later macro logic to read the last known buffer state.
-* **Raw optical sensor readback**: Adds firmware and helper support for reading raw optical sensor bits.
-* **Interpreted buffer fill state**: Adds firmware and helper support for decoded fill states such as `low`, `normal-low`, `normal-mid`, `normal-high`, `over-full`, and `unknown`.
-* **CP2112 communication health checks**: Adds a quiet buffer communication validator intended to print nothing on success and a clear error on failure.
-* **Raspberry Pi 5 CP2112 setup notes**: Adds recovery/setup documentation for CP2112 HID permissions, `hidapi`, and udev rules on Raspberry Pi OS / Klipper systems.
+The Klipper helper files and basic examples are located in ./klipper/extras/AsTechEvolves Toolchanger Version/
 
 ## Basic Configuration Changes
 

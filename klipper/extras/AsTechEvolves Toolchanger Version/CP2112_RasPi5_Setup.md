@@ -1,6 +1,6 @@
 # CP2112 HID Recovery Reference
 
-Recovery notes for getting a Silicon Labs CP2112 USB HID-to-I2C bridge working on a Raspberry Pi 5 running Klipper/Moonraker.
+Notes for getting a Silicon Labs CP2112 USB HID-to-I2C bridge working on a Raspberry Pi 5 running Klipper/Moonraker.
 
 This was written for a Voron/Klipper setup where helper scripts run from the Klipper Python environment:
 
@@ -57,7 +57,7 @@ sudo apt install -y libhidapi-hidraw0 libhidapi-dev
 
 ## 2. Create CP2112 Check Helper
 
-Save this as:
+Save this as: `Replace <username> as required...`
 
 ```text
 /home/<username>/printer_data/config/helpers/cp2112_hid_check.py

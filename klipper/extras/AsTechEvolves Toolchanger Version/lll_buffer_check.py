@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 
-HELPER = Path("/home/goofballtech/printer_data/config/helpers/lll_cp2112_buffer.py")
+HELPER = Path("/home/<username>/printer_data/config/helpers/lll_cp2112_buffer.py")
 
 
 def fail(name: str, addr: str, message: str, output: str = "") -> int:
