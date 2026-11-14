@@ -123,6 +123,59 @@ TEST(BufferLogic, ReactToOpticalSensors) {
   EXPECT_EQ(hw.lines.back(), "status=hold");
 }
 
+// Regression: filament jammed (e.g. still in the hotend during unload) pins the buffer on an end
+// sensor. The motor must time out and de-energize instead of running forever.
+static void expectRegularStallTimesOut(bool retract) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt2 = true;
+  buf.init();
+  hw.serialSend("set_timeout 5000\n");
+  buf.loop();
+
+  // Buffer goes to an end sensor and stays there.
+  hw.opt2 = false;
+  (retract ? hw.opt3 : hw.opt1) = true;
+  const auto moving = retract ? FakeHardware::TestMotor::Retract : FakeHardware::TestMotor::Push;
+  hw.now += 1000;
+  buf.loop(); // Motor starts here; the 5000 ms window begins now.
+  EXPECT_EQ(hw.lastMotor, moving);
+  for (int i = 0; i < 4; ++i) {
+    hw.now += 1000;
+    buf.loop();
+    EXPECT_EQ(hw.lastMotor, moving) << "Should still be moving before the timeout";
+  }
+
+  hw.now += 999;
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, moving) << "Should still be moving 1 ms before the timeout";
+
+  hw.now += 1;
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Manual);
+  EXPECT_TRUE(std::any_of(hw.lines.begin(), hw.lines.end(),
+                          [](const std::string &line) { return line == "timed_out=1"; }));
+
+  // Must stay latched off even though the end sensor is still triggered.
+  for (int i = 0; i < 10; ++i) {
+    hw.now += 60000;
+    buf.loop();
+    EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  }
+
+  // Host can explicitly re-arm AUTO.
+  hw.serialSend("regular\n");
+  buf.loop();
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Regular);
+  EXPECT_EQ(hw.lastMotor, moving);
+}
+
+TEST(BufferLogic, RegularModeStuckRetractTimesOut) { expectRegularStallTimesOut(true); }
+
+TEST(BufferLogic, RegularModeStuckPushTimesOut) { expectRegularStallTimesOut(false); }
+
 TEST(BufferLogic, ContinuousMode) {
   Buffer<FakeHardware> buf;
   FakeHardware &hw = buf.getHardware();

@@ -45,6 +45,29 @@ public:
   bool optical2() const { return opt2; }
   bool optical3() const { return opt3; }
   bool filamentPresent() const { return presence; }
+
+  // Mirrors BufferHardware: bit0 = optical1, bit1 = optical2, bit2 = optical3.
+  uint8_t getSensorBits() const {
+    return static_cast<uint8_t>((opt1 ? 0x01 : 0) | (opt2 ? 0x02 : 0) | (opt3 ? 0x04 : 0));
+  }
+
+  // Same mapping as BufferHardware::getFillStateFromBits (0 = low ... 4 = over-full, 5 = unknown).
+  uint8_t getFillState() const {
+    switch (getSensorBits()) {
+    case 0x01:
+      return 0;
+    case 0x00:
+      return 1;
+    case 0x02:
+      return 2;
+    case 0x06:
+      return 3;
+    case 0x04:
+      return 4;
+    default:
+      return 5;
+    }
+  }
   bool buttonForward() const { return btnF; }
   bool buttonBackward() const { return btnB; }
   void setErrorLed(bool on) { errorLed = on; }

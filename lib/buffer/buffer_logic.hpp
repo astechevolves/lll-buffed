@@ -763,18 +763,12 @@ private:
       return;
     }
 
-    bool move = false;
-
     if (hw.optical1()) {
       // Low buffer position: feed filament toward the toolhead side.
-      setMotor(Motor::Push);
-      moveStart = hw.timeMs();
-      move = true;
+      startRegularMove(Motor::Push);
     } else if (hw.optical3()) {
       // Over-extended buffer position: retract filament toward the spool side.
-      setMotor(Motor::Retract);
-      moveStart = hw.timeMs();
-      move = true;
+      startRegularMove(Motor::Retract);
     } else if (hw.optical2()) {
       // Center/settled position: hold the buffer if the motor was previously active.
       if (motor != Motor::Off) {
@@ -783,15 +777,28 @@ private:
     }
 
     if (motor == Motor::Push || motor == Motor::Retract) {
-      if (!move && hw.timeMs() - moveStart >= timeoutMs) {
-        // Movement was commanded but no sensor state refreshed the motion timer.
+      // moveStart marks the start of the current run and is NOT refreshed while an end sensor stays
+      // triggered. If the filament is jammed (e.g. still stuck in the hotend during an unload), the
+      // buffer stays pinned on optical1/optical3 and the motor would otherwise run forever.
+      if (timeoutMs > 0 && hw.timeMs() - moveStart >= timeoutMs) {
+        // Latch off (de-energized) until the host or a button explicitly re-arms the buffer.
+        // Manual mode is used because Regular would immediately restart the motor and Hold would
+        // keep the coils energized indefinitely.
         timedOut = true;
-        setMode(Mode::Hold);
-        setMotor(Motor::Hold);
+        setMode(Mode::Manual);
+        setMotor(Motor::Off);
       }
     } else {
       timedOut = false;
     }
+  }
+
+  void startRegularMove(const Motor dir) {
+    // Only start the timeout window when the motor starts moving or reverses direction.
+    if (motor != dir) {
+      moveStart = hw.timeMs();
+    }
+    setMotor(dir);
   }
 
   void handleEmptying() {
