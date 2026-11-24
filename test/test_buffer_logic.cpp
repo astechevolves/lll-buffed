@@ -743,3 +743,98 @@ TEST(BufferLogic, I2CSettings) {
   ASSERT_EQ(emptyingTimeoutData.size(), sizeof(uint32_t));
   EXPECT_EQ(*reinterpret_cast<uint32_t *>(emptyingTimeoutData.data()), 4567u);
 }
+
+TEST(BufferLogic, ParkIgnoresSensorsUntilFilamentRemoved) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt2 = true;
+  buf.init();
+
+  hw.serialSend("park\n");
+  buf.loop();
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Parked);
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  EXPECT_TRUE(std::any_of(hw.lines.begin(), hw.lines.end(),
+                          [](const std::string &line) { return line == "mode=parked"; }));
+
+  // Low buffer position would make Regular push the old filament back in.
+  hw.opt2 = false;
+  hw.opt1 = true;
+  for (int i = 0; i < 10; ++i) {
+    hw.now += 1000;
+    buf.loop();
+    EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+    EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Parked);
+  }
+
+  // Old filament pulled out by hand: back to Regular, motor stays off (no emptying push).
+  hw.opt1 = false;
+  hw.presence = false;
+  buf.loop();
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Regular);
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  for (int i = 0; i < 5; ++i) {
+    hw.now += 1000;
+    buf.loop();
+    EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Regular);
+    EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  }
+
+  // New roll inserted at a low buffer position: Regular feeds as usual.
+  hw.presence = true;
+  hw.opt1 = true;
+  buf.loop();
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Push);
+}
+
+TEST(BufferLogic, ParkWithoutFilamentActsLikeOff) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = false;
+  buf.init();
+  hw.serialSend("park\n");
+  buf.loop();
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Regular);
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+}
+
+TEST(BufferLogic, ParkButtonPressTakesOver) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt2 = true;
+  buf.init();
+  hw.serialSend("park\n");
+  buf.loop();
+  hw.btnF = true;
+  buf.loop();
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Manual);
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Push);
+}
+
+TEST(BufferLogic, I2CCommandPark) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt1 = true;
+  buf.init();
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Push);
+
+  std::vector<uint8_t> data = { REG_COMMAND, CMD_PARK };
+  hw.simulateI2CReceive(data);
+  EXPECT_EQ(buf.getMode(), Buffer<FakeHardware>::Mode::Parked);
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+
+  hw.now += 1000;
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+
+  // Mode register reports the new value.
+  hw.simulateI2CReceive({ REG_MODE });
+  hw.simulateI2CRequest();
+  ASSERT_EQ(hw.i2cTxBuffer.size(), 1);
+  EXPECT_EQ(hw.i2cTxBuffer[0], static_cast<uint8_t>(Buffer<FakeHardware>::Mode::Parked));
+}

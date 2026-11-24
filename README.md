@@ -6,7 +6,8 @@ In addition to the upstream firmware features, this fork adds the following::
 
 Adds CP2112 USB-to-I²C control for operating the buffers from Klipper on a Raspberry Pi.
 Adds multi-buffer/toolchanger support, with individually addressed buffers and example routing macros.
-Adds a full Klipper-side command set for auto, off, hold, push, retract, bounded-distance moves, speed, and timeout settings.
+Adds a full Klipper-side command set for auto, off, hold, park, push, retract, bounded-distance moves, speed, and timeout settings.
+Adds a Parked mode for the end of an unload, so old filament still in the entry presence switch is not fed back to the hotend.
 Adds safer bounded movement, including motion confirmation, maximum-distance limits, and automatic return to normal buffer operation.
 Adds readback of all three raw optical sensors.
 Adds decoded buffer-fill states: low, normal-low, normal-mid, normal-high, over-full, and unknown.
@@ -75,6 +76,7 @@ The added macro examples use numbered buffer macro names, such as:
 ```text
 BUFFER_AUTO_0
 BUFFER_OFF_0
+BUFFER_PARK_0
 BUFFER_MOVE_0
 BUFFER_STATUS_0
 BUFFER_CAPTURE_0
@@ -156,3 +158,22 @@ BUFFER_PULL_0 CONFIRM=1
 ```
 
 This keeps normal load/unload logic on bounded `MOVE_DIST` moves while still leaving forced push/pull available for testing.
+
+### Parked Mode (End of Unload)
+
+OFF only stops the motor at that moment. The buffer stays in normal auto mode, so the next optical-sensor change can start the motor again. After an unload the old filament is still in the entry presence switch (it sits before the motor and has to be pulled out by hand), so a buffer left in OFF can feed that filament back toward the hotend.
+
+PARK fixes this:
+
+```text
+BUFFER_PARK_0            ; one buffer
+BUFFER_PARK_ACTIVE_TOOL  ; buffer paired to the current tool
+```
+
+- Motor off, optical sensors ignored while filament is still in the presence switch.
+- When the presence switch clears (old filament removed), the buffer returns to normal auto mode without the usual run-out push. The next filament it sees is treated as a new roll.
+- A physical button press or any other mode command (AUTO, OFF, HOLD, PUSH/PULL, MOVE) also leaves PARK. Sending AUTO while the old filament is still in the switch re-arms normal feeding, so it can feed again.
+- Parking with no filament present behaves like OFF.
+- Status reports the mode as `PARKED`.
+
+Firmware commands: UART `park`, I2C command `0x06` (`CMD_PARK`). Firmware older than this change ignores command `0x06`, so flash every buffer before switching unload macros from OFF to PARK.

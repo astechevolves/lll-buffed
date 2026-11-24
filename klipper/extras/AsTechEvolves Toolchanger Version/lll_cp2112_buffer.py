@@ -16,7 +16,7 @@ import hid
 # Purpose:
 # - Control one or more lll-buffed buffer(s) over a CP2112 HID USB-to-SMBus bridge.
 # - Expose the full current lll-buffed I2C toolbox:
-#   - state commands: off, auto/regular, hold/manual
+#   - state commands: off, auto/regular, hold/manual, park
 #   - modal debug motion: push/feed, pull/retract
 #   - bounded firmware moves: move by distance
 #   - firmware-side prestage: move to a requested buffer level/state
@@ -178,12 +178,16 @@ BUFFER_CMDS = {
     "feed": 0x03,
     "retract": 0x04,
     "pull": 0x04,
+    # After an unload: motor off, optical sensors ignored, until the presence
+    # switch clears (old filament pulled out). Then firmware returns to AUTO.
+    "park": 0x06,
 }
 
 # Reported mode names. These are read from REG_MODE.
 # NOTE: Command 0x02 is called hold/manual in commands, but reported modes
 # can distinguish HOLD and MANUAL depending on firmware state.
 MODE_PRESTAGE = 6
+MODE_PARKED = 7
 
 MODE_NAMES = {
     0: "REGULAR",
@@ -193,6 +197,7 @@ MODE_NAMES = {
     4: "MANUAL",
     5: "EMPTYING",
     MODE_PRESTAGE: "PRESTAGE",
+    MODE_PARKED: "PARKED",
 }
 
 # Reported motor state names read from REG_MOTOR.

@@ -66,6 +66,7 @@ enum I2CCommand : uint8_t {
   CMD_PUSH = 3,
   CMD_RETRACT = 4,
   CMD_PRESTAGE = 5,
+  CMD_PARK = 6,
   CMD_REBOOT_DFU = 0xDF,
 };
 #endif
@@ -85,7 +86,11 @@ public:
     Hold,
     Manual,
     Emptying,
-    Prestage
+    Prestage,
+    // After an unload: motor off and optical sensors ignored while the old
+    // filament still sits in the presence switch. Returns to Regular once the
+    // presence switch clears, so the next filament seen is a new roll.
+    Parked
   };
 
 private:
@@ -252,6 +257,9 @@ public:
     case Mode::Prestage:
       handlePrestage();
       break;
+    case Mode::Parked:
+      handleParked();
+      break;
     }
 
     updateHoldTimeout();
@@ -337,6 +345,8 @@ private:
     } else if (strcmp(cmd, "off") == 0 || strcmp(cmd, "o") == 0) {
       setMode(Mode::Regular);
       setMotor(Motor::Off);
+    } else if (strcmp(cmd, "park") == 0) {
+      park();
     } else if (strcmp(cmd, "query") == 0 || strcmp(cmd, "q") == 0) {
       updateStatus(true);
     } else if (strcmp(cmd, "prestage") == 0) {
@@ -600,6 +610,9 @@ private:
       setMode(Mode::Regular);
       setMotor(Motor::Off);
       break;
+    case CMD_PARK:
+      park();
+      break;
     case CMD_REBOOT_DFU:
       hw.writeLineF("mode=dfu");
       HW::rebootDFU();
@@ -793,6 +806,28 @@ private:
     }
   }
 
+  void park() {
+    timedOut = false;
+    setMode(Mode::Parked);
+    setMotor(Motor::Off);
+    if (!hw.filamentPresent()) {
+      // Nothing to hold back: behave like OFF.
+      setMode(Mode::Regular);
+    }
+  }
+
+  void handleParked() {
+    if (hw.filamentPresent()) {
+      setMotor(Motor::Off);
+      return;
+    }
+    // Old filament pulled out of the presence switch: re-arm so the next
+    // insertion is handled as a new roll. lastFilament is already false on the
+    // next pass, so Regular sees an empty path and stays off (no Emptying push).
+    setMode(Mode::Regular);
+    setMotor(Motor::Off);
+  }
+
   void startRegularMove(const Motor dir) {
     // Only start the timeout window when the motor starts moving or reverses direction.
     if (motor != dir) {
@@ -902,6 +937,9 @@ private:
         break;
       case Mode::Prestage:
         modeStr = "prestage";
+        break;
+      case Mode::Parked:
+        modeStr = "parked";
         break;
       }
       hw.writeLineF("mode=%s", modeStr);
