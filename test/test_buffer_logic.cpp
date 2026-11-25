@@ -676,6 +676,131 @@ TEST(BufferLogic, I2CMoveCommand) {
   }));
 }
 
+// The CP2112 host sends 4-byte values as four 1-byte writes (reg+0..reg+3).
+static void stagedWrite(FakeHardware &hw, const uint8_t reg, const uint8_t *bytes, const bool skipByte2 = false) {
+  for (uint8_t i = 0; i < 4; i++) {
+    if (skipByte2 && i == 2) {
+      continue;
+    }
+    hw.simulateI2CReceive({ static_cast<uint8_t>(reg + i), bytes[i] });
+  }
+}
+
+TEST(BufferLogic, I2CStagedMoveRecoversFromLostByte) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  buf.init();
+
+  // +20 mm with byte 2 lost: nothing may run, and nothing may be left over.
+  const float push = 20.0F;
+  stagedWrite(hw, REG_MOVE_DIST, reinterpret_cast<const uint8_t *>(&push), true);
+  EXPECT_NE(hw.lastMotor, FakeHardware::TestMotor::Push);
+
+  // A following -100 mm must retract. Before the fix it committed with the
+  // leftover sign byte of +20 and ran as +25 mm (push).
+  const float pull = -100.0F;
+  stagedWrite(hw, REG_MOVE_DIST, reinterpret_cast<const uint8_t *>(&pull));
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Retract);
+}
+
+TEST(BufferLogic, I2CMoveWhileRegularPushIsNotSwallowed) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt1 = true; // low buffer: Regular mode starts a push
+  hw.opt2 = false;
+  hw.opt3 = false;
+  buf.init();
+  buf.loop();
+  ASSERT_EQ(hw.lastMotor, FakeHardware::TestMotor::Push);
+  const int before = hw.pushCalls;
+
+  // A push move arriving while the motor state already reads PUSH must still
+  // send the stepper command (it used to be skipped as "already pushing").
+  const float push = 20.0F;
+  stagedWrite(hw, REG_MOVE_DIST, reinterpret_cast<const uint8_t *>(&push));
+  EXPECT_EQ(hw.pushCalls, before + 1);
+  EXPECT_TRUE(std::any_of(hw.lines.begin(), hw.lines.end(), [](const std::string &line) {
+    return line.find("mode=move_command") != std::string::npos;
+  }));
+}
+
+TEST(BufferLogic, ParkDuringMoveIsDeferredUntilMoveEnds) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt1 = false;
+  hw.opt2 = true;
+  hw.opt3 = false;
+  buf.init();
+  buf.loop();
+
+  // Start a long pull, then PARK right away (what the unload does).
+  const float pull = -100.0F; // default speed -> runs for a while
+  stagedWrite(hw, REG_MOVE_DIST, reinterpret_cast<const uint8_t *>(&pull));
+  ASSERT_EQ(hw.lastMotor, FakeHardware::TestMotor::Retract);
+  hw.simulateI2CReceive({ REG_COMMAND, CMD_PARK });
+
+  // The pull keeps running: PARK must not stop it.
+  hw.now += 100;
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Retract);
+
+  // When the move ends it parks (motor off), instead of holding.
+  hw.now += 60000;
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  EXPECT_TRUE(std::any_of(hw.lines.begin(), hw.lines.end(), [](const std::string &line) {
+    return line.find("mode=parked") != std::string::npos;
+  }));
+
+  // Parked behaviour as before: old filament pulled out -> re-armed, no push.
+  hw.presence = false;
+  buf.loop();
+  buf.loop();
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+}
+
+TEST(BufferLogic, ParkWhileIdleStillParksImmediately) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  hw.opt1 = false;
+  hw.opt2 = true;
+  hw.opt3 = false;
+  buf.init();
+  buf.loop();
+
+  hw.simulateI2CReceive({ REG_COMMAND, CMD_PARK });
+  EXPECT_EQ(hw.lastMotor, FakeHardware::TestMotor::Off);
+  EXPECT_TRUE(std::any_of(hw.lines.begin(), hw.lines.end(), [](const std::string &line) {
+    return line.find("mode=parked") != std::string::npos;
+  }));
+}
+
+TEST(BufferLogic, I2CStagedTimeoutWrites) {
+  Buffer<FakeHardware> buf;
+  FakeHardware &hw = buf.getHardware();
+  hw.presence = true;
+  buf.init();
+
+  const uint32_t timeout = 60000U;
+  const uint32_t holdTimeout = 12345U;
+  stagedWrite(hw, REG_PARAM_TIMEOUT, reinterpret_cast<const uint8_t *>(&timeout));
+  stagedWrite(hw, REG_PARAM_HOLD_TIMEOUT, reinterpret_cast<const uint8_t *>(&holdTimeout));
+
+  hw.simulateI2CReceive({ REG_PARAM_TIMEOUT });
+  hw.simulateI2CRequest();
+  ASSERT_EQ(hw.i2cTxBuffer.size(), sizeof(uint32_t));
+  EXPECT_EQ(*reinterpret_cast<uint32_t *>(hw.i2cTxBuffer.data()), timeout);
+
+  hw.simulateI2CReceive({ REG_PARAM_HOLD_TIMEOUT });
+  hw.simulateI2CRequest();
+  ASSERT_EQ(hw.i2cTxBuffer.size(), sizeof(uint32_t));
+  EXPECT_EQ(*reinterpret_cast<uint32_t *>(hw.i2cTxBuffer.data()), holdTimeout);
+}
+
 TEST(BufferLogic, I2CSettings) {
   Buffer<FakeHardware> buf;
   FakeHardware &hw = buf.getHardware();

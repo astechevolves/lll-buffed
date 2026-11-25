@@ -73,7 +73,11 @@ public:
   void setErrorLed(bool on) { errorLed = on; }
   void setPresenceLed(bool on) { presLed = on; }
   void setPresenceOutput(bool on) { presOut = on; }
-  void stepperPush(float) { lastMotor = TestMotor::Push; }
+  int pushCalls{ 0 }; // counts stepper push commands actually sent to the driver
+  void stepperPush(float) {
+    lastMotor = TestMotor::Push;
+    pushCalls++;
+  }
   void stepperRetract(float) { lastMotor = TestMotor::Retract; }
   void stepperHold() { lastMotor = TestMotor::Hold; }
   void stepperOff() { lastMotor = TestMotor::Off; }

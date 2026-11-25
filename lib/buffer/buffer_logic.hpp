@@ -151,6 +151,8 @@ private:
 
   bool filamentPresent{ false };
   bool timedOut{ false };
+  // PARK requested while a move was running: park when the move ends.
+  bool parkAfterMove{ false };
 
   ButtonState btnFwd;
   ButtonState btnBack;
@@ -197,6 +199,12 @@ private:
   uint8_t i2cSpeedBytes[sizeof(float)]{};
   uint8_t i2cMoveDistMask{ 0 };
   uint8_t i2cSpeedMask{ 0 };
+  // Staged 1-byte writes to the uint32 timeout registers (TIMEOUT,
+  // EMPTYING_TIMEOUT, HOLD_TIMEOUT). One shared buffer: the host writes one
+  // register's four bytes at a time, and byte 0 selects the register.
+  uint8_t i2cU32Bytes[sizeof(uint32_t)]{};
+  uint8_t i2cU32Mask{ 0 };
+  uint8_t i2cU32Base{ 0 };
 #endif
 
 public:
@@ -346,7 +354,7 @@ private:
       setMode(Mode::Regular);
       setMotor(Motor::Off);
     } else if (strcmp(cmd, "park") == 0) {
-      park();
+      requestPark();
     } else if (strcmp(cmd, "query") == 0 || strcmp(cmd, "q") == 0) {
       updateStatus(true);
     } else if (strcmp(cmd, "prestage") == 0) {
@@ -363,7 +371,7 @@ private:
         const float ms = tiny::abs(val) * 1000.0F / speedMmS;
         moveEnd = hw.timeMs() + static_cast<uint32_t>(ms);
         setMode(Mode::MoveCommand);
-        setMotor(moveDir);
+        startMoveMotor(moveDir);
       }
     } else if ((arg = startsWith(cmd, "set_", "timeout", " ", nullptr))) {
       timeoutMs = tiny::strtoul(arg);
@@ -451,16 +459,25 @@ private:
     moveEnd = hw.timeMs() + static_cast<uint32_t>(ms);
 
     setMode(Mode::MoveCommand);
-    setMotor(moveDir);
+    startMoveMotor(moveDir);
     updateStatus();
   }
 
   bool handleI2CStagedWrite(const uint8_t reg, const uint8_t value) {
+    // All staged values: the host always sends bytes 0,1,2,3 in order, so
+    // byte 0 starts a fresh value. Do NOT drop the "offset == 0" resets: if a
+    // byte is ever lost, a leftover byte would otherwise stay in the buffer
+    // and every later value would commit with the previous command's last
+    // byte (sign/exponent), e.g. MOVE_DIST -100 running as +25 or -1600.
+
     // MOVE_DIST lives at 0x01..0x04 as a 4-byte little-endian float.
     // Commit the move only after all four bytes have been received.
     if (reg >= REG_MOVE_DIST && reg < REG_MOVE_DIST + sizeof(float)) {
       const uint8_t offset = reg - REG_MOVE_DIST;
 
+      if (offset == 0) {
+        i2cMoveDistMask = 0;
+      }
       i2cMoveDistBytes[offset] = value;
       i2cMoveDistMask |= static_cast<uint8_t>(1U << offset);
 
@@ -480,6 +497,9 @@ private:
     if (reg >= REG_PARAM_SPEED && reg < REG_PARAM_SPEED + sizeof(float)) {
       const uint8_t offset = reg - REG_PARAM_SPEED;
 
+      if (offset == 0) {
+        i2cSpeedMask = 0;
+      }
       i2cSpeedBytes[offset] = value;
       i2cSpeedMask |= static_cast<uint8_t>(1U << offset);
 
@@ -493,6 +513,31 @@ private:
           speedMmS = newSpeed;
           updateStatus();
         }
+      }
+
+      return true;
+    }
+
+    // TIMEOUT / EMPTYING_TIMEOUT / HOLD_TIMEOUT live at 0x0C, 0x10, 0x14 as
+    // 4-byte little-endian uint32. Without this the host's staged writes were
+    // silently ignored (the full-write path below needs size >= 4).
+    if (reg >= REG_PARAM_TIMEOUT && reg < REG_PARAM_HOLD_TIMEOUT + sizeof(uint32_t)) {
+      const uint8_t offset = (reg - REG_PARAM_TIMEOUT) % sizeof(uint32_t);
+      const uint8_t base = reg - offset;
+
+      if (offset == 0) {
+        i2cU32Mask = 0;
+        i2cU32Base = base;
+      }
+      if (base != i2cU32Base) {
+        return true; // stray byte for a register whose byte 0 was lost
+      }
+      i2cU32Bytes[offset] = value;
+      i2cU32Mask |= static_cast<uint8_t>(1U << offset);
+
+      if (i2cU32Mask == 0x0F) {
+        i2cU32Mask = 0;
+        onI2CWrite(base, sizeof(i2cU32Bytes), i2cU32Bytes); // reuse the full-write path
       }
 
       return true;
@@ -611,7 +656,7 @@ private:
       setMotor(Motor::Off);
       break;
     case CMD_PARK:
-      park();
+      requestPark();
       break;
     case CMD_REBOOT_DFU:
       hw.writeLineF("mode=dfu");
@@ -806,7 +851,19 @@ private:
     }
   }
 
+  // PARK during a running move is deferred until the move ends instead of
+  // stopping it, so the host can start a long pull and park in one go (the
+  // motor ends de-energized, not held all night). Any other time: park now.
+  void requestPark() {
+    if (mode == Mode::MoveCommand) {
+      parkAfterMove = true;
+      return;
+    }
+    park();
+  }
+
   void park() {
+    parkAfterMove = false;
     timedOut = false;
     setMode(Mode::Parked);
     setMotor(Motor::Off);
@@ -871,7 +928,11 @@ private:
   
   void handleMoveCommand() {
     if (hw.timeMs() >= moveEnd) {
-      if (hw.filamentPresent()) {
+      if (parkAfterMove) {
+        // Deferred PARK (sent during the move, e.g. at the start of the
+        // unload's long pull): park now instead of holding the motor.
+        park();
+      } else if (hw.filamentPresent()) {
         setMode(Mode::Hold);
         setMotor(Motor::Hold);
       } else {
@@ -1027,6 +1088,20 @@ private:
       hw.setInterrupt(true);
     }
 #endif
+  }
+
+  // A move must always (re)issue the stepper command. setMotor() skips the
+  // driver when the state already matches, and after AUTO the state can read
+  // PUSH while the stepper is not actually turning - every following move in
+  // that direction was then silently swallowed (load stage-1 bumps after the
+  // first). Do NOT replace this with a plain setMotor(). Moves still do not
+  // queue: a new move replaces moveEnd, the motor just keeps running.
+  void startMoveMotor(const Motor dir) {
+    parkAfterMove = false; // a new move cancels a PARK deferred by an earlier one
+    if (motor == dir) {
+      motor = Motor::Hold; // force setMotor() past its "already in this state" check
+    }
+    setMotor(dir);
   }
 
   void setMotor(Motor m) {
